@@ -1,0 +1,4 @@
+.DS_Store
+preflight/swift/src/.build
+/preflight/swift/payload/preflight
+preflight/**/build
