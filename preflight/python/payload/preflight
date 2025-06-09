@@ -1,0 +1,97 @@
+#!/usr/local/bin/managed_python3
+
+"""
+Dynamically rewrites **SoftwareRepoURL** in `/Library/Preferences/ManagedInstalls.plist`.
+
+Logic
+  • If the current catalogue matches a regex AND the device is a **desktop**,
+    pick the first on-prem HTTP mirror that answers HEAD / with 200.
+  • Otherwise fall back to the cloud repo.
+"""
+
+import os
+import re
+import sys
+import logging
+import plistlib
+import subprocess
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict
+
+# ────────── constants ──────────
+MANAGED_INSTALS = Path("/Library/Preferences/ManagedInstalls.plist")
+LOG_FILE        = "/Library/Managed Installs/Logs/ManagedSoftwareUpdate.log"
+
+CLOUD_REPO   = "https://munki.example.org/munki"             # default
+ON_PREM_REPO = [
+    "http://mainserver.example.org/munki",                   # first choice
+    "http://redundancyserver.example.org/munki"              # second choice
+]
+
+CATALOG_SCOPE = re.compile(r"Curriculum|Faculty|Kiosk|Testing")  # only these switch
+
+# ────────── logger ──────────
+log = logging.getLogger("repo-switcher")
+log.setLevel(logging.INFO)
+fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+for h in (logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)):
+    h.setFormatter(fmt); log.addHandler(h)
+
+# ────────── helpers ──────────
+def load_plist(p: Path) -> Dict[str, Any]:
+    return plistlib.load(p.open("rb")) if p.exists() else {}
+
+def save_plist(p: Path, obj: Dict[str, Any]) -> None:
+    tmp = p.with_suffix(".tmp")
+    plistlib.dump(obj, tmp.open("wb"))
+    tmp.replace(p)
+
+def machine_type() -> str:
+    out = subprocess.run(
+        ["/usr/sbin/system_profiler", "SPPowerDataType"],
+        capture_output=True, text=True
+    ).stdout
+    return "laptop" if "Battery Power" in out else "desktop"
+
+def head_ok(url: str, timeout: int = 3) -> bool:
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, method="HEAD"),
+                                    timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+# ────────── main ──────────
+def main() -> None:
+    if os.geteuid() != 0:
+        log.error("Must run as root"); sys.exit(1)
+
+    mi = load_plist(MANAGED_INSTALS)
+    catalogs = ",".join(mi.get("Catalogs", []))
+
+    # scope guard
+    if not CATALOG_SCOPE.search(catalogs):
+        log.info("Catalogs %s out of scope – leaving repo unchanged", catalogs)
+        return
+
+    # laptops always stay on cloud
+    if machine_type() == "laptop":
+        log.info("Laptop detected – forcing cloud repo")
+        mi["SoftwareRepoURL"] = CLOUD_REPO
+        save_plist(MANAGED_INSTALS, mi)
+        return
+
+    # desktops: pick first responsive on-prem mirror
+    selected = CLOUD_REPO
+    for repo in ON_PREM_REPO:
+        if head_ok(repo):
+            selected = repo
+            break
+
+    mi["SoftwareRepoURL"] = selected
+    save_plist(MANAGED_INSTALS, mi)
+    log.info("SoftwareRepoURL → %s", selected)
+
+if __name__ == "__main__":
+    main()
