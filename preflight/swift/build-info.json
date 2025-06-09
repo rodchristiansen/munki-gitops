@@ -1,0 +1,18 @@
+{
+    "postinstall_action": "none",
+    "suppress_bundle_relocation": true,
+    "name": "MunkiPreflight.pkg",
+    "distribution_style": true,
+    "install_location": "/usr/local/munki/",
+    "version": "2025.06.06",
+    "ownership": "recommended",
+    "identifier": "com.domain.MunkiPreflight",
+    "signing_info": {
+        "identity": "Developer ID Installer: ACME (7THDHBV74)",
+        "keychain": "${HOME}/Library/Keychains/signing.keychain",
+        "timestamp": true
+    },
+    "notarization_info": {
+        "keychain_profile": "notarization_credentials"
+    }
+}
