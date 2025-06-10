@@ -1,0 +1,63 @@
+name: Munki Deploy (Azure Blob + Front Door)
+
+on:
+  push:
+    branches: [main]
+    paths:   ['deployment/**']
+
+jobs:
+  deploy:
+    runs-on: macos-13
+    env:
+      AZ_STORAGE_URL: ${{ secrets.AZ_STORAGE_URL }}   # container URL w/out SAS
+      AZ_SAS:        ${{ secrets.AZ_SAS_TOKEN }}      # starts with '?sv='
+      FDO_ENDPOINT:  ${{ secrets.FD_ENDPOINT }}       # mysite.azurefd.net
+      AZ_SUBSCRIPTION: ${{ secrets.AZ_SUB }}
+      AZ_CLIENT_ID:    ${{ secrets.AZ_CLIENT_ID }}
+      AZ_TENANT_ID:    ${{ secrets.AZ_TENANT_ID }}
+      AZ_CLIENT_SECRET:${{ secrets.AZ_CLIENT_SECRET }}
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          deployment
+          pipelines
+        fetch-depth: 1
+
+    - name: Install Munki + azcopy
+      run: |
+        brew install munki
+        brew install --cask azcopy
+
+    - name: Build catalogs
+      run: |
+        /usr/local/munki/makecatalogs --skip-pkg-check "${{ github.workspace }}/deployment"
+
+    - name: Clean temp chunks
+      run: |
+        find deployment/pkgs -type f \( -name '*.pkg.*' -o -name '*.dmg.*' \) -delete
+
+    - name: Upload to Azure Blob (azcopy)
+      run: |
+        for d in catalogs manifests pkgsinfo; do
+          azcopy sync \
+            "deployment/$d" \
+            "$AZ_STORAGE_URL/repo/deployment/$d$AZ_SAS" \
+            --recursive --delete-destination=true
+        done
+
+    - name: Purge Front Door cache
+      uses: azure/login@v2
+      with:
+        tenant-id:     ${{ env.AZ_TENANT_ID }}
+        client-id:     ${{ env.AZ_CLIENT_ID }}
+        client-secret: ${{ env.AZ_CLIENT_SECRET }}
+        subscription-id: ${{ env.AZ_SUBSCRIPTION }}
+
+    - name: Purge paths
+      run: |
+        az network front-door purge-endpoint \
+          --name "$FDO_ENDPOINT" \
+          --content-paths '/*'

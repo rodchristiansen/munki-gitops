@@ -1,0 +1,80 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - /deployment/**
+
+pool:
+  vmImage: macOS-13
+
+variables:
+  - group: munki-repo-secrets
+  - name: S3_BUCKET_NAME       # e.g. munki-prod-bucket
+    value: '<your-bucket>'
+  - name: AWS_DISTRIBUTION_ID  # CloudFront distribution
+    value: '<E123ABCXYZ>'
+  - name: REPO_PATH
+    value: '/deployment'
+
+stages:
+- stage: PushMunkiRepo
+  jobs:
+  - job: CloudDeploy
+    steps:
+    - checkout: self
+      clean: true
+      persistCredentials: true
+
+    - script: |
+        git sparse-checkout init --cone
+        git sparse-checkout set deployment pipelines
+      displayName: Sparse checkout
+
+    - script: |
+        brew install --cask git-credential-manager
+        brew install munki
+      displayName: Install Munki tools (Homebrew)
+
+    - script: |
+        /usr/local/munki/makecatalogs --skip-pkg-check \
+          "$(Build.SourcesDirectory)$(REPO_PATH)"
+      displayName: Run makecatalogs
+
+    - script: |
+        find "$(Build.SourcesDirectory)/deployment/pkgs" \
+             -type f -name '*.pkg.*' -delete
+      displayName: Sanitize /pkgs folder
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: AWS Credentials
+        regionName: ca-central-1
+        awsCommand: s3
+        awsSubCommand: sync
+        awsArguments: |
+          $(Build.SourcesDirectory)/deployment/catalogs \
+          s3://$(S3_BUCKET_NAME)/repo/deployment/catalogs --delete
+      displayName: Sync catalogs
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: AWS Credentials
+        regionName: ca-central-1
+        awsCommand: s3
+        awsSubCommand: sync
+        awsArguments: |
+          $(Build.SourcesDirectory)/deployment/{manifests,pkgsinfo} \
+          s3://$(S3_BUCKET_NAME)/repo/deployment/ --delete
+      displayName: Sync manifests + pkgsinfo
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: AWS Credentials
+        regionName: us-east-1
+        awsCommand: cloudfront
+        awsSubCommand: create-invalidation
+        awsArguments: |
+          --distribution-id $(AWS_DISTRIBUTION_ID) --paths "/*"
+      displayName: Invalidate CloudFront
