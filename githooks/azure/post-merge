@@ -1,0 +1,55 @@
+#!/usr/bin/env zsh
+#
+# post-merge hook — download Munki pkgs, icons, catalogs from Azure Blob Storage
+#
+# Repo is configured with:   git config core.hooksPath .githooks
+# (so this file lives in   <repo>/.githooks/post-merge)
+#
+# Requires azcopy v10+.  AZCOPY_SAS_URL must already embed a container-level SAS.
+# Change BRANCH if your primary branch is not “main”.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+set -f
+setopt null_glob
+
+# Absolute repo root, independent of where the hook lives
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Log setup
+LOGDIR="$REPO_ROOT/.git/logs"
+mkdir -p "$LOGDIR"
+TODAY=$(date +%F)
+LOGFILE="$LOGDIR/post-merge-sync-$TODAY.log"
+: >"$LOGFILE"
+find "$LOGDIR" -name 'post-merge-sync-*.log' -mtime +7 -delete
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"; }
+
+# ----- Config --------------------------------------------------------------
+AZCOPY_SAS_URL='https://yourstorage.blob.core.windows.net/munki?<SAS>'
+BRANCH='main'
+AZCOPY=$(command -v azcopy)
+
+# ----- Branch gate ---------------------------------------------------------
+[[ $(git symbolic-ref --quiet --short HEAD) == "$BRANCH" ]] || {
+  log "Skipping sync — not on $BRANCH"; exit 0; }
+
+log "Syncing Munki assets from Azure Blob → $REPO_ROOT"
+
+# Shared include / exclude patterns
+INCLUDE='*.yaml;*.yml;*.json;*.plist;*.pkg;*.dmg;*.zip;*.tar.gz;*.png;*.icns;*.svg'
+EXCLUDE='.DS_Store;.git/*'
+
+for DIR in icons catalogs pkgs; do
+  SRC="$AZCOPY_SAS_URL/repo/deployment/$DIR"
+  DEST="$REPO_ROOT/deployment/$DIR"
+  log "▶ syncing $DIR"
+  "$AZCOPY" sync "$SRC" "$DEST" \
+      --recursive \
+      --include-pattern "$INCLUDE" \
+      --exclude-pattern "$EXCLUDE" \
+      --delete-destination=true | tee -a "$LOGFILE"
+done
+
+log "Post-merge Azure sync complete"

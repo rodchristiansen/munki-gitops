@@ -1,0 +1,50 @@
+#!/usr/bin/env zsh
+#
+# post-merge hook — downloads Munki repo pkgs, icons, catalogs from S3
+# Designed for repos using:  git config core.hooksPath .githooks
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+set -f
+setopt null_glob
+
+# Absolute path to the repo root
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Log directory inside the repo
+LOGDIR="$REPO_ROOT/.git/logs"
+mkdir -p "$LOGDIR"
+
+# S3 bucket (no trailing slash)
+BUCKET_URL='s3://your-munki-bucket/repo'
+
+AWS=$(command -v aws)
+TODAY=$(date +%F)
+LOGFILE="$LOGDIR/post-merge-sync-$TODAY.log"
+: >"$LOGFILE"
+find "$LOGDIR" -name 'post-merge-sync-*.log' -mtime +7 -delete
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"; }
+
+# Only run on main (change if your primary branch differs)
+[[ $(git symbolic-ref --quiet --short HEAD) == main ]] || {
+  log "Skipping sync — not on main"; exit 0; }
+
+log "Syncing Munki assets from $BUCKET_URL → $REPO_ROOT"
+
+SYNC_RULES=(
+  --exclude '*'
+  --include '*.yaml' --include '*.yml' --include '*.json' --include '*.plist'
+  --include '*.pkg'  --include '*.dmg' --include '*.zip'  --include '*.tar.gz'
+  --include '*.png'  --include '*.icns' --include '*.svg'
+  --exclude '.DS_Store' --exclude '**/.DS_Store' --exclude '*.git/*'
+)
+
+for DIR in icons catalogs pkgs; do
+  SRC="$BUCKET_URL/deployment/$DIR/"
+  DEST="$REPO_ROOT/deployment/$DIR"
+  log "▶ syncing $DIR"
+  "$AWS" s3 sync "$SRC" "$DEST" "${SYNC_RULES[@]}" --delete | tee -a "$LOGFILE"
+done
+
+log "Post-merge sync complete"

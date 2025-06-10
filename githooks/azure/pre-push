@@ -1,0 +1,65 @@
+#!/usr/bin/env zsh
+#
+#  pre-push hook — uploads Munki pkgs and icons to Azure Blob Storage
+#
+#  Repo uses:  git config core.hooksPath .githooks
+#  (so this file lives in .githooks/pre-push, not .git/hooks)
+#
+#  • Upload runs only when pushing “main”; other branches are ignored.
+#  • Aborts if local main is behind origin/main (unless fast-forwardable).
+#  • Logs to .git/logs with 7-day rotation.
+#  • Requires azcopy v10+ and a container-level SAS URL.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+set -f
+setopt null_glob
+
+# Absolute repo root, independent of where the hook file lives
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Blob container URL (embed SAS token)
+AZ_URL='https://yourstorage.blob.core.windows.net/munki?<SAS>'
+
+AZCOPY=$(command -v azcopy)
+
+# ── logging ────────────────────────────────────────────────────────────────
+LOGDIR="$REPO_ROOT/.git/logs"
+mkdir -p "$LOGDIR"
+TODAY=$(date +%F)
+LOGFILE="$LOGDIR/pre-push-sync-$TODAY.log"
+: >"$LOGFILE"
+find "$LOGDIR" -name 'pre-push-sync-*.log' -mtime +7 -delete
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"; }
+
+# ── branch gate ────────────────────────────────────────────────────────────
+[[ $(git symbolic-ref --quiet --short HEAD) == main ]] || {
+  log "Skipping upload — not on main"; exit 0; }
+
+# ── up-to-date guard ───────────────────────────────────────────────────────
+git fetch --quiet origin main
+if (( $(git rev-list --count HEAD..origin/main) > 0 )); then
+  log "Local main is behind origin/main — pull / rebase first"; exit 1
+fi
+
+log "Uploading Munki assets to Azure Blob"
+
+INCLUDE='*.pkg;*.dmg;*.zip;*.tar.gz;*.png;*.icns;*.svg;*.yaml;*.yml;*.json;*.plist'
+EXCLUDE='.DS_Store;.git/*'
+
+sync_dir() {
+  local SRC="$REPO_ROOT/deployment/$1"
+  local DST="$AZ_URL/repo/deployment/$1"
+  log "▶ syncing $1"
+  "$AZCOPY" sync "$SRC" "$DST" \
+    --recursive \
+    --include-pattern "$INCLUDE" \
+    --exclude-pattern "$EXCLUDE" \
+    --delete-destination=true | tee -a "$LOGFILE"
+}
+
+sync_dir icons
+sync_dir pkgs
+
+log "✔ pre-push upload completed"
