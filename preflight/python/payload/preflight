@@ -29,8 +29,6 @@ ON_PREM_REPO = [
     "http://redundancyserver.example.org/munki"              # second choice
 ]
 
-CATALOG_SCOPE = re.compile(r"Curriculum|Faculty|Kiosk|Testing")  # only these switch
-
 # ────────── logger ──────────
 log = logging.getLogger("repo-switcher")
 log.setLevel(logging.INFO)
@@ -69,11 +67,6 @@ def main() -> None:
 
     mi = load_plist(MANAGED_INSTALS)
     catalogs = ",".join(mi.get("Catalogs", []))
-
-    # scope guard
-    if not CATALOG_SCOPE.search(catalogs):
-        log.info("Catalogs %s out of scope – leaving repo unchanged", catalogs)
-        return
 
     # laptops always stay on cloud
     if machine_type() == "laptop":
