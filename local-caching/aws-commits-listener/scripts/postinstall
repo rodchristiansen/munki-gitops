@@ -1,0 +1,3 @@
+#!/bin/zsh
+sudo launchctl enable system/com.domain.CommitsListener
+sudo launchctl load /Library/LaunchDaemons/com.domain.CommitsListener.plist
