@@ -1,6 +1,6 @@
 # Modern Munki DevOps
 
-> **MacDevOps YVR 2025 Companion Post**
+**MacDevOps YVR 2025 presentation Companion Repo** - [YouTube link](https://www.youtube.com/watch?v=ayQqGT9S_cM&t=6s&pp=ygUQcm9kIGNocmlzdGlhbnNlbg%3D%3D)
 
 A year ago, we were managing Macs the way most orgs still do: one shared Mac, VNC’d into, running a local copy of Munki with no real version control or workflow isolation. Git was an afterthought. Deployments were manual. It worked—until it didn’t scale.
 
