@@ -1,0 +1,237 @@
+#!/usr/bin/env bash
+#
+# ──────────────────────────────────────────────────────────────────────────────
+#  pre-commit hook  –  validates Munki pkgsinfo before committing (AWS)
+#
+#  Runs makecatalogs and catches:
+#    1. Parse errors (malformed XML/YAML) → blocks commit with dialog alert
+#    2. Missing pkg warnings → attempts auto-download, blocks if still missing
+#
+#  Uses swiftDialog for user-friendly error notifications (optional).
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Configuration ──────────────────────────────────────────
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [[ -z "$REPO_ROOT" ]]; then
+  REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+fi
+DEPLOYMENT="$REPO_ROOT/deployment"
+DIALOG="/usr/local/bin/dialog"
+
+# ── check for makecatalogs ─────────────────────────────────
+if ! command -v makecatalogs &>/dev/null; then
+  echo "ERROR: makecatalogs not found" >&2
+  echo "Install Munki tools from: https://github.com/munki/munki" >&2
+  exit 1
+fi
+
+# ── check for dialog (optional) ────────────────────────────
+USE_DIALOG=false
+if [[ -x "$DIALOG" ]]; then
+  USE_DIALOG=true
+fi
+
+# ── run makecatalogs and capture output ────────────────────
+echo "Running makecatalogs to validate pkgsinfo..."
+
+MAKECATALOGS_OUTPUT=$(mktemp)
+MAKECATALOGS_EXIT=0
+
+makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT" || MAKECATALOGS_EXIT=$?
+
+# ── check for parse errors (Unexpected error) ──────────────
+PARSE_ERRORS=$(grep -E "Unexpected error reading" "$MAKECATALOGS_OUTPUT" || true)
+
+if [[ -n "$PARSE_ERRORS" ]]; then
+  ERROR_FILES=$(echo "$PARSE_ERRORS" | sed 's/.*Unexpected error reading \([^:]*\):.*/\1/' | tr '\n' '\n' | sort -u)
+  ERROR_COUNT=$(echo "$ERROR_FILES" | wc -l | tr -d ' ')
+  
+  if echo "$PARSE_ERRORS" | grep -q "Unexpected character"; then
+    PLIST_ERROR=$(echo "$PARSE_ERRORS" | grep -o 'Unexpected character [^"]*' | head -1)
+  elif echo "$PARSE_ERRORS" | grep -q "NSDebugDescription="; then
+    PLIST_ERROR=$(echo "$PARSE_ERRORS" | grep -o 'NSDebugDescription=[^,}]*' | head -1 | sed 's/NSDebugDescription=//')
+  else
+    PLIST_ERROR=""
+  fi
+  
+  ERROR_LIST=$(echo "$ERROR_FILES" | sed 's/^/• /')
+  
+  if [[ -n "$PLIST_ERROR" ]]; then
+    ERROR_MSG="**Parse Error:** ${PLIST_ERROR}\n\n**Affected file(s):**\n${ERROR_LIST}"
+  else
+    ERROR_MSG="**Affected file(s):**\n${ERROR_LIST}"
+  fi
+  
+  if [[ "$USE_DIALOG" == "true" ]]; then
+    "$DIALOG" \
+      --title "Commit Blocked: malformed pkgsinfo" \
+      --icon "SF=xmark.circle.fill,palette=white,red,red" \
+      --iconsize 80 \
+      --message "**makecatalogs** found **${ERROR_COUNT}** pkgsinfo file(s) that cannot be parsed.\n\n${ERROR_MSG}" \
+      --button1text "OK" \
+      --messagefont "size=14" \
+      --width 700 \
+      --height 400 \
+      --moveable \
+      --ontop
+  fi
+  
+  rm -f "$MAKECATALOGS_OUTPUT"
+  echo ""
+  echo "COMMIT BLOCKED: Fix the parse error(s) above before committing."
+  echo "$ERROR_FILES"
+  exit 1
+fi
+
+# ── check for missing pkg warnings ─────────────────────────
+MISSING_PKGS=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
+
+if [[ -n "$MISSING_PKGS" ]]; then
+  WARNING_COUNT=$(echo "$MISSING_PKGS" | wc -l | tr -d ' ')
+  
+  MISSING_PKG_PATHS=()
+  while IFS= read -r line; do
+    pkg_path=$(echo "$line" | sed 's/.*refers to missing installer item: //')
+    MISSING_PKG_PATHS+=("$pkg_path")
+  done <<< "$MISSING_PKGS"
+  
+  WARNING_LIST=$(echo "$MISSING_PKGS" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
+  
+  if [[ $WARNING_COUNT -gt 10 ]]; then
+    WARNING_LIST="${WARNING_LIST}\n\n...and $((WARNING_COUNT - 10)) more"
+  fi
+  
+  echo ""
+  echo "Found ${WARNING_COUNT} missing package(s). Automatically downloading from S3..."
+  
+  PATH_ARGS=()
+  for pkg_path in "${MISSING_PKG_PATHS[@]}"; do
+    PATH_ARGS+=(--path "$pkg_path")
+  done
+  
+  POST_MERGE_HOOK="$REPO_ROOT/.githooks/post-merge"
+  if [[ ! -x "$POST_MERGE_HOOK" ]]; then
+    POST_MERGE_HOOK="$REPO_ROOT/githooks/aws/post-merge"
+  fi
+  
+  if [[ "$USE_DIALOG" == "true" ]]; then
+    DIALOG_CMD=$(mktemp)
+    SYNC_LOG=$(mktemp)
+    
+    "$DIALOG" \
+      --title "Downloading Missing Packages" \
+      --icon "SF=arrow.down.circle.fill,palette=white,blue,blue" \
+      --iconsize 80 \
+      --message "**${WARNING_COUNT}** package(s) missing locally.\n\nDownloading specific files from AWS S3...\n\n${WARNING_LIST}" \
+      --progress 100 \
+      --progresstext "Connecting to AWS S3..." \
+      --width 600 \
+      --height 600 \
+      --moveable \
+      --ontop \
+      --commandfile "$DIALOG_CMD" &
+    DIALOG_PID=$!
+    sleep 0.5
+    
+    echo "progress: 10" >> "$DIALOG_CMD"
+    echo "progresstext: Authenticating with AWS..." >> "$DIALOG_CMD"
+    
+    CURRENT_PKG=0
+    if [[ -x "$POST_MERGE_HOOK" ]]; then
+      "$POST_MERGE_HOOK" "${PATH_ARGS[@]}" 2>&1 | while IFS= read -r line; do
+        echo "$line" >> "$SYNC_LOG"
+        echo "$line"
+        if [[ "$line" == *"-> syncing:"* ]]; then
+          CURRENT_PKG=$((CURRENT_PKG + 1))
+          PROGRESS=$(( 10 + (80 * CURRENT_PKG / ${#MISSING_PKG_PATHS[@]}) ))
+          PKG_NAME=$(echo "$line" | sed 's/.*-> syncing: //' | sed 's/deployment\/pkgs\///')
+          echo "progress: $PROGRESS" >> "$DIALOG_CMD"
+          echo "progresstext: Downloading: $PKG_NAME" >> "$DIALOG_CMD"
+        elif [[ "$line" == *"Targeted path sync complete"* ]]; then
+          echo "progress: 100" >> "$DIALOG_CMD"
+          echo "progresstext: Download complete!" >> "$DIALOG_CMD"
+        fi
+      done
+    fi
+    
+    sleep 0.5
+    echo "quit:" >> "$DIALOG_CMD"
+    wait $DIALOG_PID 2>/dev/null || true
+    rm -f "$DIALOG_CMD" "$SYNC_LOG"
+  else
+    if [[ -x "$POST_MERGE_HOOK" ]]; then
+      "$POST_MERGE_HOOK" "${PATH_ARGS[@]}"
+    else
+      echo "WARNING: post-merge hook not found at $POST_MERGE_HOOK"
+      echo "Cannot auto-download missing packages"
+    fi
+  fi
+  
+  echo ""
+  echo "Re-validating pkgsinfo after download..."
+  rm -f "$MAKECATALOGS_OUTPUT"
+  MAKECATALOGS_OUTPUT=$(mktemp)
+  makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT"
+  
+  MISSING_PKGS_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
+  
+  if [[ -n "$MISSING_PKGS_RECHECK" ]]; then
+    STILL_MISSING=$(echo "$MISSING_PKGS_RECHECK" | wc -l | tr -d ' ')
+    STILL_LIST=$(echo "$MISSING_PKGS_RECHECK" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
+    
+    if [[ "$USE_DIALOG" == "true" ]]; then
+      "$DIALOG" \
+        --title "Commit Blocked: Missing Packages" \
+        --icon "SF=xmark.circle.fill,palette=white,red,red" \
+        --iconsize 80 \
+        --message "After syncing from S3, **${STILL_MISSING}** package(s) are still missing.\n\nThese packages don't exist in AWS S3:\n\n${STILL_LIST}\n\nYou'll need to:\n• Add the missing .pkg files manually, or\n• Remove/update the pkgsinfo references" \
+        --button1text "OK" \
+        --messagefont "size=14" \
+        --width 700 \
+        --height 450 \
+        --moveable \
+        --ontop
+    fi
+    
+    rm -f "$MAKECATALOGS_OUTPUT"
+    echo ""
+    echo "COMMIT BLOCKED: Some packages are still missing after download."
+    exit 1
+  else
+    rm -f "$MAKECATALOGS_OUTPUT"
+    echo ""
+    echo "All missing packages downloaded successfully"
+    echo "pkgsinfo validation passed"
+    exit 0
+  fi
+fi
+
+# ── check for makecatalogs exit code ───────────────────────
+if [[ $MAKECATALOGS_EXIT -ne 0 ]]; then
+  ERROR_TAIL=$(tail -20 "$MAKECATALOGS_OUTPUT")
+  
+  if [[ "$USE_DIALOG" == "true" ]]; then
+    "$DIALOG" \
+      --title "Commit Blocked: makecatalogs Failed" \
+      --icon "SF=xmark.circle.fill,palette=white,red,red" \
+      --iconsize 80 \
+      --message "**makecatalogs** exited with error code ${MAKECATALOGS_EXIT}.\n\n\`\`\`\n${ERROR_TAIL}\n\`\`\`" \
+      --button1text "OK" \
+      --messagefont "size=14" \
+      --width 700 \
+      --height 400 \
+      --moveable \
+      --ontop
+  fi
+  
+  rm -f "$MAKECATALOGS_OUTPUT"
+  echo ""
+  echo "COMMIT BLOCKED: makecatalogs failed with exit code $MAKECATALOGS_EXIT"
+  exit 1
+fi
+
+# ── cleanup and success ────────────────────────────────────
+rm -f "$MAKECATALOGS_OUTPUT"
+echo "pkgsinfo validation passed"
+exit 0

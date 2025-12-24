@@ -1,55 +1,478 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 #
-# post-merge hook — download Munki pkgs, icons, catalogs from Azure Blob Storage
+# ──────────────────────────────────────────────────────────────────────────────
+#  post-merge hook  –  targeted package downloads after git pull/merge
 #
-# Repo is configured with:   git config core.hooksPath .githooks
-# (so this file lives in   <repo>/.githooks/post-merge)
+#  • Fires automatically after:
+#       - `git pull` (even fast-forward)         - `git merge`
+#       - `git checkout <branch>`                - rebases that move HEAD
 #
-# Requires azcopy v10+.  AZCOPY_SAS_URL must already embed a container-level SAS.
-# Change BRANCH if your primary branch is not “main”.
-# ---------------------------------------------------------------------------
+#  • Default behavior (no flags):
+#       - Parses changed pkgsinfo files (YAML/plist)
+#       - Extracts installer_item_location from each
+#       - Downloads ONLY those specific packages using hash-based azcopy copy
+#       - Syncs catalogs/icons folders if changed
+#
+#  • Flags:
+#       --sync    : Full folder sync with hash comparison (incremental)
+#       --force   : Full download with confirmation (forces re-download of all)
+#       --dry-run : Show what would be downloaded without actually downloading
+#
+#  • Daily rotating log kept in .git/logs (7-day retention).
+# ──────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 set -f
-setopt null_glob
+shopt -s nullglob
 
-# Absolute repo root, independent of where the hook lives
-REPO_ROOT=$(git rev-parse --show-toplevel)
+# ── Configuration (customize these for your environment) ───
+# Set your Munki repo root path
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [[ -z "$REPO_ROOT" ]]; then
+  REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+fi
 
-# Log setup
+# Azure Storage configuration - customize these values or set via environment
+STORAGE_ACCOUNT="${MUNKI_STORAGE_ACCOUNT:-yourstorageaccount}"
+CONTAINER="${MUNKI_CONTAINER:-munki}"
+STORAGE_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}"
+
+# ── check for azcopy ───────────────────────────────────────
+# Use absolute path to azcopy to ensure it works in all environments (VS Code, Tower, etc.)
+if [[ -x "/opt/homebrew/bin/azcopy" ]]; then
+  AZCOPY="/opt/homebrew/bin/azcopy"
+elif command -v azcopy &>/dev/null; then
+  AZCOPY=$(command -v azcopy)
+else
+  echo "" >&2
+  echo "ERROR: azcopy not found" >&2
+  echo "" >&2
+  echo "The post-merge hook needs azcopy to download packages from Azure Blob Storage." >&2
+  echo "" >&2
+  echo "To install azcopy:" >&2
+  echo "  brew install azcopy" >&2
+  echo "" >&2
+  echo "Or download from: https://aka.ms/downloadazcopy" >&2
+  echo "" >&2
+  exit 1
+fi
+
+# ── command line options ───────────────────────────────────
+SYNC_MODE=false
+FORCE_MODE=false
+DRY_RUN=false
+TARGET_PATHS=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --sync)
+      SYNC_MODE=true
+      shift
+      ;;
+    --force)
+      FORCE_MODE=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --path)
+      shift
+      [[ $# -gt 0 ]] && TARGET_PATHS+=("$1")
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+# ── logging ────────────────────────────────────────────────
 LOGDIR="$REPO_ROOT/.git/logs"
 mkdir -p "$LOGDIR"
 TODAY=$(date +%F)
-LOGFILE="$LOGDIR/post-merge-sync-$TODAY.log"
+LOGFILE="$LOGDIR/hook-post-merge-download-$TODAY.log"
 : >"$LOGFILE"
-find "$LOGDIR" -name 'post-merge-sync-*.log' -mtime +7 -delete
+find "$LOGDIR" -name 'hook-post-merge-download-*.log' -mtime +7 -exec rm {} \;
 
-log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"; }
+log() {
+  local ts=$(date '+%Y-%m-%d %H:%M:%S')
+  printf '%s %s\n' "$ts" "$*" | tee -a "$LOGFILE"
+}
 
-# ----- Config --------------------------------------------------------------
-AZCOPY_SAS_URL='https://yourstorage.blob.core.windows.net/munki?<SAS>'
-BRANCH='main'
-AZCOPY=$(command -v azcopy)
+next_index() {
+  local max=0
+  for f in "$LOGDIR"/hook-post-merge-download-"$TODAY"-*; do
+    [[ -e $f ]] || continue
+    local n=${f##*-}; n=${n%.log}
+    (( n > max )) && max=$n
+  done
+  echo $((max+1))
+}
 
-# ----- Branch gate ---------------------------------------------------------
-[[ $(git symbolic-ref --quiet --short HEAD) == "$BRANCH" ]] || {
-  log "Skipping sync — not on $BRANCH"; exit 0; }
+# ── Azure authentication check ─────────────────────────────
+check_azure_auth() {
+  # Use timeout to prevent hanging - Azure CLI can hang indefinitely on auth issues
+  # Try gtimeout (coreutils) first, fallback to perl-based timeout
+  local timeout_cmd=""
+  if command -v gtimeout &>/dev/null; then
+    timeout_cmd="gtimeout 10"
+  else
+    # Fallback: use perl to implement timeout
+    timeout_cmd="perl -e 'alarm shift @ARGV; exec @ARGV' 10"
+  fi
+  
+  if ! eval "$timeout_cmd az account show &>/dev/null"; then
+    log "Azure CLI not authenticated or timed out. Please run 'az login' first."
+    exit 1
+  fi
+}
 
-log "Syncing Munki assets from Azure Blob → $REPO_ROOT"
+# ── parse pkgsinfo files for installer locations ───────────
+# Extract installer_item_location from a single pkgsinfo file
+extract_location_from_pkgsinfo() {
+  local pkgsinfo_file="$1"
+  local location=""
+  
+  if [[ "$pkgsinfo_file" =~ \.(yaml|yml)$ ]]; then
+    location=$(grep -E '^\s*installer_item_location:\s*' "$pkgsinfo_file" 2>/dev/null | sed -E 's/^\s*installer_item_location:\s*//' | tr -d '"' | xargs | head -1)
+  else
+    # Assume plist (including extensionless files)
+    location=$(plutil -extract installer_item_location raw "$pkgsinfo_file" 2>/dev/null | xargs || true)
+  fi
+  
+  echo "$location"
+}
 
-# Shared include / exclude patterns
-INCLUDE='*.yaml;*.yml;*.json;*.plist;*.pkg;*.dmg;*.zip;*.tar.gz;*.png;*.icns;*.svg'
-EXCLUDE='.DS_Store;.git/*'
+# Extract installer locations from a list of changed pkgsinfo files
+extract_installer_locations() {
+  local changed_pkgsinfo="$1"
+  local installer_locations=()
+  
+  while IFS= read -r pkgsinfo_file; do
+    [[ -z "$pkgsinfo_file" ]] && continue
+    [[ ! -f "$REPO_ROOT/$pkgsinfo_file" ]] && continue
+    
+    local location=$(extract_location_from_pkgsinfo "$REPO_ROOT/$pkgsinfo_file")
+    
+    if [[ -n "$location" ]]; then
+      installer_locations+=("$location")
+      log "  Found package: $location"
+    fi
+  done <<< "$changed_pkgsinfo"
+  
+  printf '%s\n' "${installer_locations[@]}"
+}
 
-for DIR in icons catalogs pkgs; do
-  SRC="$AZCOPY_SAS_URL/repo/deployment/$DIR"
-  DEST="$REPO_ROOT/deployment/$DIR"
-  log "▶ syncing $DIR"
-  "$AZCOPY" sync "$SRC" "$DEST" \
-      --recursive \
-      --include-pattern "$INCLUDE" \
-      --exclude-pattern "$EXCLUDE" \
-      --delete-destination=true | tee -a "$LOGFILE"
-done
+# ── build canonical package list from ALL pkgsinfo files ───
+# This mirrors makecatalogs logic - the source of truth for what packages should exist
+build_canonical_pkg_list() {
+  local pkgsinfo_dir="$REPO_ROOT/deployment/pkgsinfo"
+  local canonical_list=()
+  
+  # Find all pkgsinfo files (yaml, yml, plist, or extensionless)
+  while IFS= read -r -d '' pkgsinfo_file; do
+    local location=$(extract_location_from_pkgsinfo "$pkgsinfo_file")
+    if [[ -n "$location" ]]; then
+      canonical_list+=("$location")
+    fi
+  done < <(find "$pkgsinfo_dir" -type f \( -name "*.yaml" -o -name "*.yml" -o -name "*.plist" -o ! -name "*.*" \) -print0 2>/dev/null)
+  
+  # Return sorted unique list
+  printf '%s\n' "${canonical_list[@]}" | sort -u
+}
 
-log "Post-merge Azure sync complete"
+# ── cleanup orphan packages not referenced by any pkgsinfo ─
+cleanup_orphan_packages() {
+  local pkgs_dir="$REPO_ROOT/deployment/pkgs"
+  local canonical_file=$(mktemp)
+  local orphan_count=0
+  
+  log "Building canonical package list from pkgsinfo files..."
+  build_canonical_pkg_list > "$canonical_file"
+  local canonical_count=$(wc -l < "$canonical_file" | xargs)
+  log "Found $canonical_count packages referenced in pkgsinfo"
+  
+  # Find all packages in pkgs directory
+  log "Scanning for orphan packages..."
+  while IFS= read -r -d '' pkg_file; do
+    # Get relative path from pkgs directory
+    local rel_path="${pkg_file#$pkgs_dir/}"
+    
+    # Check if this package is in the canonical list
+    if ! grep -qxF "$rel_path" "$canonical_file"; then
+      log "  Orphan: $rel_path"
+      if [[ "$DRY_RUN" == "true" ]]; then
+        log "    [DRY RUN] Would delete"
+      else
+        rm -f "$pkg_file"
+        log "    Deleted"
+      fi
+      ((orphan_count++)) || true
+    fi
+  done < <(find "$pkgs_dir" -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.zip" -o -name "*.mobileconfig" \) -print0 2>/dev/null)
+  
+  rm -f "$canonical_file"
+  
+  if [[ $orphan_count -gt 0 ]]; then
+    log "Cleaned up $orphan_count orphan package(s)"
+    # Clean up empty directories
+    find "$pkgs_dir" -type d -empty -delete 2>/dev/null || true
+  else
+    log "No orphan packages found"
+  fi
+}
+
+# ── change detection ───────────────────────────────────────
+detect_changes() {
+  # Force mode - requires confirmation
+  if [[ "$FORCE_MODE" == "true" ]]; then
+    echo "force"
+    return
+  fi
+  
+  # Sync mode - full folder sync with hash comparison
+  if [[ "$SYNC_MODE" == "true" ]]; then
+    echo "sync"
+    return
+  fi
+  
+  # Check if we have enough commit history for change detection
+  if ! git rev-parse HEAD~1 >/dev/null 2>&1; then
+    log "No previous commit available for change detection. Use --sync for full sync."
+    echo "none"
+    return
+  fi
+  
+  # Get changed files in deployment directory
+  local changed_files=$(git diff --name-only HEAD~1 HEAD -- deployment/ 2>/dev/null || true)
+  
+  if [[ -z "$changed_files" ]]; then
+    log "No changes detected in deployment/ directory. Skipping sync."
+    echo "none"
+    return
+  fi
+  
+  # Build result string with what needs downloading
+  local needs_catalogs=false
+  local needs_icons=false
+  local changed_pkgsinfo=""
+  
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    
+    if [[ "$file" =~ ^deployment/catalogs/ ]]; then
+      needs_catalogs=true
+    elif [[ "$file" =~ ^deployment/icons/ ]]; then
+      needs_icons=true
+    elif [[ "$file" =~ ^deployment/pkgsinfo/ ]]; then
+      changed_pkgsinfo+="$file"$'\n'
+    fi
+  done <<< "$changed_files"
+  
+  # Build result
+  local result=""
+  [[ "$needs_catalogs" == "true" ]] && result+="catalogs "
+  [[ "$needs_icons" == "true" ]] && result+="icons "
+  [[ -n "$changed_pkgsinfo" ]] && result+="pkgsinfo"
+  
+  result=$(echo "$result" | xargs)
+  
+  if [[ -z "$result" ]]; then
+    log "Changes detected but not in sync-relevant directories. Skipping sync."
+    echo "none"
+  else
+    # Store changed pkgsinfo for later processing
+    echo "$changed_pkgsinfo" > "$REPO_ROOT/.git/logs/.changed-pkgsinfo-$$"
+    echo "$result"
+  fi
+}
+
+# ── targeted path download (for pre-commit auto-fix) ───────────────────────────
+# This runs BEFORE branch gate since it's explicitly requested
+if [[ ${#TARGET_PATHS[@]} -gt 0 ]]; then
+  log ">> targeted path download - downloading ${#TARGET_PATHS[@]} specific package(s)"
+  
+  check_azure_auth
+  export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
+  
+  for target_path in "${TARGET_PATHS[@]}"; do
+    # Normalize path - ensure it starts with deployment/pkgs/
+    if [[ "$target_path" != deployment/* ]]; then
+      target_path="deployment/pkgs/$target_path"
+    fi
+    
+    local_path="$REPO_ROOT/$target_path"
+    remote_url="$STORAGE_URL/$target_path"
+    
+    # Create parent directory if needed
+    mkdir -p "$(dirname "$local_path")"
+    
+    log "  -> syncing: $target_path"
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "  [DRY RUN] Would download: $remote_url -> $local_path"
+    else
+      # Use azcopy copy for single file download
+      "$AZCOPY" copy "$remote_url" "$local_path" \
+        --log-level="ERROR" --output-level="essential" 2>&1 | tee -a "$LOGFILE" || {
+          log "  WARNING: Failed to download $target_path (may not exist in Azure)"
+        }
+    fi
+  done
+  
+  log 'Targeted path sync complete'
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# ── branch gate ────────────────────────────────────────────
+current_branch=$(git symbolic-ref --quiet --short HEAD || true)
+if [[ "$current_branch" != "main" ]]; then
+  log "Skipping downloads – we are in branch '$current_branch', not main."
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+log "On branch 'main' – checking for changes"
+
+# ── change detection and selective sync ────────────────────
+changed_paths=$(detect_changes)
+
+if [[ "$changed_paths" == "none" ]]; then
+  log "No sync needed"
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# ── Azure authentication ───────────────────────────────────
+check_azure_auth
+
+# ── cleanup .DS_Store and stale temp files ────────────────
+log "Cleaning up .DS_Store and stale temp files"
+find "$REPO_ROOT/deployment" -name ".DS_Store" -type f -delete 2>/dev/null || true
+find "$REPO_ROOT/deployment" -name ".az*" -type f -delete 2>/dev/null || true
+find "$REPO_ROOT/deployment" -name "*.gzPk4O" -type f -delete 2>/dev/null || true
+find "$REPO_ROOT/.git/logs" -name ".changed-pkgsinfo-*" -type f -mmin +60 -delete 2>/dev/null || true
+
+# ── set azcopy auth ────────────────────────────────────────
+export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
+
+# ── handle force mode ──────────────────────────────────────
+if [[ "$changed_paths" == "force" ]]; then
+  log "WARNING: FORCE MODE - This will download ALL data"
+  echo "This operation will download the entire repository from Azure Blob Storage."
+  echo ""
+  read -p "Continue with full download? (y/N) " -n 1 -r
+  echo ""
+  [[ ! $REPLY =~ ^[Yy]$ ]] && { log "Aborted."; exit 0; }
+  
+  log ">> force downloading deployment/catalogs"
+  "$AZCOPY" sync "$STORAGE_URL/deployment/catalogs/" "$REPO_ROOT/deployment/catalogs" \
+    --delete-destination=true --exclude-pattern="*.DS_Store" --log-level="INFO" 2>&1 | tee -a "$LOGFILE"
+  
+  log ">> force downloading deployment/pkgs"
+  "$AZCOPY" sync "$STORAGE_URL/deployment/pkgs/" "$REPO_ROOT/deployment/pkgs" \
+    --delete-destination=true --exclude-pattern="*.DS_Store" --log-level="INFO" 2>&1 | tee -a "$LOGFILE"
+  
+  log ">> force downloading deployment/icons"
+  "$AZCOPY" sync "$STORAGE_URL/deployment/icons/" "$REPO_ROOT/deployment/icons" \
+    --delete-destination=true --exclude-pattern="*.DS_Store" --log-level="INFO" 2>&1 | tee -a "$LOGFILE"
+  
+  log "Force download complete (exact mirror of Azure)"
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# ── handle sync mode (full folder with hash comparison) ────
+if [[ "$changed_paths" == "sync" ]]; then
+  log ">> sync mode - full folder sync with hash comparison"
+  
+  if [[ "$DRY_RUN" == "true" ]]; then
+    SYNC_OPTS=(--delete-destination=true --exclude-pattern="*.DS_Store" --dry-run --log-level="INFO")
+    log "DRY RUN MODE - No actual downloads will occur"
+  else
+    SYNC_OPTS=(--delete-destination=true --exclude-pattern="*.DS_Store" --log-level="ERROR" --output-level="essential")
+  fi
+  
+  log '>> syncing deployment/catalogs'
+  "$AZCOPY" sync "$STORAGE_URL/deployment/catalogs/" "$REPO_ROOT/deployment/catalogs" "${SYNC_OPTS[@]}" 2>&1 | \
+    grep -E "(DRYRUN|Job.*completed|Number of Copy Transfers|Elapsed Time|Final Job Status)" | tee -a "$LOGFILE"
+  
+  log '>> syncing deployment/pkgs'
+  "$AZCOPY" sync "$STORAGE_URL/deployment/pkgs/" "$REPO_ROOT/deployment/pkgs" "${SYNC_OPTS[@]}" 2>&1 | \
+    grep -E "(DRYRUN|Job.*completed|Number of Copy Transfers|Elapsed Time|Final Job Status)" | tee -a "$LOGFILE"
+  
+  log '>> syncing deployment/icons'
+  "$AZCOPY" sync "$STORAGE_URL/deployment/icons/" "$REPO_ROOT/deployment/icons" "${SYNC_OPTS[@]}" 2>&1 | \
+    grep -E "(DRYRUN|Job.*completed|Number of Copy Transfers|Elapsed Time|Final Job Status)" | tee -a "$LOGFILE"
+  
+  log 'Sync mode complete'
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# ── default: targeted downloads based on changes ───────────
+
+# Download catalogs if changed
+if echo "$changed_paths" | grep -q "catalogs"; then
+  log '>> syncing deployment/catalogs'
+  "$AZCOPY" sync "$STORAGE_URL/deployment/catalogs/" "$REPO_ROOT/deployment/catalogs" \
+    --exclude-pattern="*.DS_Store" --log-level="ERROR" --output-level="essential" 2>&1 | tee -a "$LOGFILE"
+fi
+
+# Download icons if changed
+if echo "$changed_paths" | grep -q "icons"; then
+  log '>> syncing deployment/icons'
+  "$AZCOPY" sync "$STORAGE_URL/deployment/icons/" "$REPO_ROOT/deployment/icons" \
+    --exclude-pattern="*.DS_Store" --log-level="ERROR" --output-level="essential" 2>&1 | tee -a "$LOGFILE"
+fi
+
+# Download specific packages if pkgsinfo changed
+if echo "$changed_paths" | grep -q "pkgsinfo"; then
+  pkgsinfo_cache="$REPO_ROOT/.git/logs/.changed-pkgsinfo-$$"
+  
+  if [[ -f "$pkgsinfo_cache" ]]; then
+    log '>> extracting package locations from changed pkgsinfo files'
+    changed_pkgsinfo=$(cat "$pkgsinfo_cache")
+    installer_locations=$(extract_installer_locations "$changed_pkgsinfo")
+    
+    if [[ -n "$installer_locations" ]]; then
+      pkg_count=$(echo "$installer_locations" | wc -l | xargs)
+      log ">> downloading $pkg_count specific package(s) with hash-based sync"
+      
+      while IFS= read -r pkg_path; do
+        [[ -z "$pkg_path" ]] && continue
+        
+        source_url="$STORAGE_URL/deployment/pkgs/$pkg_path"
+        dest_path="$REPO_ROOT/deployment/pkgs/$pkg_path"
+        dest_dir=$(dirname "$dest_path")
+        
+        # Ensure destination directory exists
+        mkdir -p "$dest_dir"
+        
+        log "  - $pkg_path"
+        
+        # Use azcopy copy with hash comparison (only downloads if changed)
+        "$AZCOPY" copy "$source_url" "$dest_path" \
+          --overwrite=ifSourceNewer --check-md5=FailIfDifferent \
+          --log-level="ERROR" --output-level="essential" 2>&1 | tee -a "$LOGFILE" || {
+          log "    WARNING: Failed to download $pkg_path (may not exist remotely)"
+        }
+      done <<< "$installer_locations"
+    else
+      log "No installer_item_location entries found in changed pkgsinfo files"
+    fi
+    
+    rm -f "$pkgsinfo_cache"
+  fi
+fi
+
+# ── cleanup orphan packages based on local pkgsinfo ────────
+# Uses LOCAL pkgsinfo as source of truth - protects uncommitted work
+log "Checking for orphan packages..."
+cleanup_orphan_packages
+
+log 'Git post-merge hook complete'
+mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"

@@ -1,65 +1,654 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 #
-#  pre-push hook — uploads Munki pkgs and icons to Azure Blob Storage
+# ──────────────────────────────────────────────────────────────────────────────
+#  pre-push hook  –  safe Azure Blob Storage upload for Munki repo
 #
-#  Repo uses:  git config core.hooksPath .githooks
-#  (so this file lives in .githooks/pre-push, not .git/hooks)
-#
-#  • Upload runs only when pushing “main”; other branches are ignored.
-#  • Aborts if local main is behind origin/main (unless fast-forwardable).
-#  • Logs to .git/logs with 7-day rotation.
-#  • Requires azcopy v10+ and a container-level SAS URL.
-# ---------------------------------------------------------------------------
-
+#  • Only runs the upload when pushing *main*.
+#      – Any other branch → skip upload, allow push.
+#  • If on main, aborts when behind origin/main (unless it can fast-forward).
+#  • Daily log rotation, smart change detection.
+#  • Supports targeted package sync with --path flag
+# ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 set -f
-setopt null_glob
+shopt -s nullglob
 
-# Absolute repo root, independent of where the hook file lives
-REPO_ROOT=$(git rev-parse --show-toplevel)
+# ── Configuration (customize these for your environment) ───
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+if [[ -z "$REPO_ROOT" ]]; then
+  REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+fi
 
-# Blob container URL (embed SAS token)
-AZ_URL='https://yourstorage.blob.core.windows.net/munki?<SAS>'
+# Azure Storage configuration - customize these values or set via environment
+STORAGE_ACCOUNT="${MUNKI_STORAGE_ACCOUNT:-yourstorageaccount}"
+CONTAINER="${MUNKI_CONTAINER:-munki}"
+STORAGE_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}"
 
-AZCOPY=$(command -v azcopy)
+# ── check for azcopy ───────────────────────────────────────
+# Use absolute path to azcopy to ensure it works in all environments (VS Code, Tower, etc.)
+if [[ -x "/opt/homebrew/bin/azcopy" ]]; then
+  AZCOPY="/opt/homebrew/bin/azcopy"
+elif command -v azcopy &>/dev/null; then
+  AZCOPY=$(command -v azcopy)
+else
+  echo "" >&2
+  echo "ERROR: azcopy not found" >&2
+  echo "" >&2
+  echo "The pre-push hook needs azcopy to upload packages to Azure Blob Storage." >&2
+  echo "" >&2
+  echo "To install azcopy:" >&2
+  echo "  brew install azcopy" >&2
+  echo "" >&2
+  echo "Or download from: https://aka.ms/downloadazcopy" >&2
+  echo "" >&2
+  exit 1
+fi
+
+# ── command line options ───────────────────────────────────
+FORCE_SYNC=false
+TARGET_PKG=""
+DRY_RUN=false
+UPLOAD_SYNC=false
+TARGET_PATHS=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --force)
+      FORCE_SYNC=true
+      shift
+      ;;
+    --pkg=*)
+      TARGET_PKG="${1#*=}"
+      shift
+      ;;
+    --path)
+      shift
+      [[ $# -gt 0 ]] && TARGET_PATHS+=("$1")
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --upload|--sync)
+      UPLOAD_SYNC=true
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 
 # ── logging ────────────────────────────────────────────────────────────────
 LOGDIR="$REPO_ROOT/.git/logs"
 mkdir -p "$LOGDIR"
 TODAY=$(date +%F)
-LOGFILE="$LOGDIR/pre-push-sync-$TODAY.log"
+LOGFILE="$LOGDIR/hook-pre-push-upload-$TODAY.log"
 : >"$LOGFILE"
-find "$LOGDIR" -name 'pre-push-sync-*.log' -mtime +7 -delete
+find "$LOGDIR" -name 'hook-pre-push-upload-*.log' -mtime +7 -exec rm {} \;
 
-log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"; }
-
-# ── branch gate ────────────────────────────────────────────────────────────
-[[ $(git symbolic-ref --quiet --short HEAD) == main ]] || {
-  log "Skipping upload — not on main"; exit 0; }
-
-# ── up-to-date guard ───────────────────────────────────────────────────────
-git fetch --quiet origin main
-if (( $(git rev-list --count HEAD..origin/main) > 0 )); then
-  log "Local main is behind origin/main — pull / rebase first"; exit 1
-fi
-
-log "Uploading Munki assets to Azure Blob"
-
-INCLUDE='*.pkg;*.dmg;*.zip;*.tar.gz;*.png;*.icns;*.svg;*.yaml;*.yml;*.json;*.plist'
-EXCLUDE='.DS_Store;.git/*'
-
-sync_dir() {
-  local SRC="$REPO_ROOT/deployment/$1"
-  local DST="$AZ_URL/repo/deployment/$1"
-  log "▶ syncing $1"
-  "$AZCOPY" sync "$SRC" "$DST" \
-    --recursive \
-    --include-pattern "$INCLUDE" \
-    --exclude-pattern "$EXCLUDE" \
-    --delete-destination=true | tee -a "$LOGFILE"
+log() {
+  local ts=$(date '+%Y-%m-%d %H:%M:%S')
+  printf '%s %s\n' "$ts" "$*" | tee -a "$LOGFILE"
 }
 
-sync_dir icons
-sync_dir pkgs
+next_index() {
+  local max=0
+  for f in "$LOGDIR"/hook-pre-push-upload-"$TODAY"-*; do
+    [[ -e $f ]] || continue
+    local n=${f##*-}; n=${n%.log}
+    (( n > max )) && max=$n
+  done
+  echo $((max+1))
+}
 
-log "✔ pre-push upload completed"
+# ── Azure authentication check ─────────────────────────────
+check_azure_auth() {
+  # Use timeout to prevent hanging - Azure CLI can hang indefinitely on auth issues
+  # Try gtimeout (coreutils) first, fallback to perl-based timeout
+  local timeout_cmd=""
+  if command -v gtimeout &>/dev/null; then
+    timeout_cmd="gtimeout 10"
+  else
+    # Fallback: use perl to implement timeout
+    timeout_cmd="perl -e 'alarm shift @ARGV; exec @ARGV' 10"
+  fi
+  
+  if ! eval "$timeout_cmd az account show &>/dev/null"; then
+    log "Azure CLI not authenticated or timed out. Please run 'az login' first."
+    exit 1
+  fi
+}
+
+# ── pkgsinfo helpers (source of truth for packages) ────────────────────────────
+# Extract installer_item_location from a single pkgsinfo file (YAML or XML)
+extract_location_from_pkgsinfo() {
+  local pkgsinfo_file="$1"
+  
+  # Try YAML format first (most common in this repo)
+  local location=$(grep -E '^installer_item_location:' "$pkgsinfo_file" 2>/dev/null | head -1 | sed 's/^installer_item_location:[[:space:]]*//' | tr -d '"'"'" || true)
+  
+  # If not found, try XML format
+  if [[ -z "$location" ]]; then
+    location=$(grep -A1 '<key>installer_item_location</key>' "$pkgsinfo_file" 2>/dev/null | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/' | head -1 || true)
+  fi
+  
+  echo "$location"
+}
+
+# Build canonical package list from ALL pkgsinfo files (mirrors makecatalogs logic)
+# For uploads, use COMMITTED pkgsinfo only - we only upload what's been committed
+build_canonical_pkg_list_committed() {
+  local pkgsinfo_dir="$REPO_ROOT/deployment/pkgsinfo"
+  local pkg_list=()
+  
+  # Get list of pkgsinfo files from the commit being pushed (HEAD)
+  # This ensures we only upload packages referenced by committed pkgsinfo
+  while IFS= read -r pkgsinfo_file; do
+    [[ -z "$pkgsinfo_file" ]] && continue
+    [[ ! -f "$pkgsinfo_file" ]] && continue
+    
+    local location=$(extract_location_from_pkgsinfo "$pkgsinfo_file")
+    if [[ -n "$location" ]]; then
+      pkg_list+=("$location")
+    fi
+  done < <(find "$pkgsinfo_dir" -type f \( -name "*.yaml" -o -name "*.plist" -o -name "*.pkgsinfo" \) 2>/dev/null)
+  
+  # Return sorted unique list
+  printf '%s\n' "${pkg_list[@]}" | sort -u
+}
+
+# Remove orphan packages from Azure that aren't referenced by any committed pkgsinfo
+cleanup_azure_orphans() {
+  log "Building canonical package list from committed pkgsinfo files..."
+  
+  local canonical_list_file=$(mktemp)
+  build_canonical_pkg_list_committed > "$canonical_list_file"
+  local canonical_count=$(wc -l < "$canonical_list_file" | tr -d ' ')
+  log "Found $canonical_count packages referenced in committed pkgsinfo"
+  
+  # List all packages in Azure
+  local azure_list_file=$(mktemp)
+  "$AZCOPY" list "$STORAGE_URL/deployment/pkgs/" --output-type=text 2>/dev/null | \
+    grep -v '^INFO:' | \
+    sed 's/;.*//' | \
+    sed 's|^deployment/pkgs/||' | \
+    sort -u > "$azure_list_file" || true
+  
+  local azure_count=$(wc -l < "$azure_list_file" | tr -d ' ')
+  log "Found $azure_count packages in Azure blob storage"
+  
+  # Find orphans (in Azure but not in canonical list)
+  local orphans_file=$(mktemp)
+  comm -23 "$azure_list_file" "$canonical_list_file" > "$orphans_file"
+  local orphan_count=$(wc -l < "$orphans_file" | tr -d ' ')
+  
+  if [[ $orphan_count -gt 0 ]]; then
+    log "Found $orphan_count orphan packages in Azure to remove:"
+    while IFS= read -r orphan; do
+      [[ -z "$orphan" ]] && continue
+      log "  - $orphan"
+      if [[ "$DRY_RUN" != "true" ]]; then
+        "$AZCOPY" remove "$STORAGE_URL/deployment/pkgs/$orphan" \
+          --log-level="ERROR" 2>&1 | tee -a "$LOGFILE" || true
+      fi
+    done < "$orphans_file"
+    log "Azure orphan cleanup complete"
+  else
+    log "No orphan packages found in Azure"
+  fi
+  
+  rm -f "$canonical_list_file" "$azure_list_file" "$orphans_file"
+}
+
+# ── change detection ───────────────────────────────────────
+detect_changes() {
+  # Returns newline-separated list of specific subdirectories to sync
+  # Format: "pkgs/mgmt" "pkgs/apps" "icons" etc.
+  
+  # If targeting specific package, only sync that
+  if [[ -n "$TARGET_PKG" ]]; then
+    if [[ -d "$REPO_ROOT/packages/$TARGET_PKG" ]]; then
+      echo "packages/$TARGET_PKG"
+    else
+      log "Package directory '$TARGET_PKG' not found" >&2
+      echo "none"
+    fi
+    return
+  fi
+  
+  # If force sync, sync everything
+  if [[ "$FORCE_SYNC" == "true" ]]; then
+    echo "all"
+    return
+  fi
+  
+  # If upload sync, use hash comparison mode
+  if [[ "$UPLOAD_SYNC" == "true" ]]; then
+    echo "upload"
+    return
+  fi
+  
+  # Get the range of commits being pushed by checking against origin
+  local remote_ref="origin/$(git symbolic-ref --short HEAD)"
+  local changed_files=""
+  
+  # Check if remote ref exists
+  if git show-ref --verify --quiet "refs/remotes/$remote_ref"; then
+    # Get changed files in commits being pushed
+    changed_files=$(git diff --name-only "$remote_ref"..HEAD -- deployment/ 2>/dev/null || true)
+    log "Checking changes from $remote_ref to HEAD"
+  else
+    # Fallback to last commit if no remote tracking
+    if git rev-parse HEAD~1 >/dev/null 2>&1; then
+      changed_files=$(git diff --name-only HEAD~1 HEAD -- deployment/ 2>/dev/null || true)
+      log "Checking changes from HEAD~1 to HEAD (no remote tracking)"
+    else
+      log "No previous commit available for change detection. Syncing all."
+      echo "all"
+      return
+    fi
+  fi
+  
+  if [[ -z "$changed_files" ]]; then
+    log "No changes detected in deployment/ directory. Skipping sync."
+    echo "none"
+    return
+  fi
+  
+  log "Changed files detected:"
+  echo "$changed_files" | while IFS= read -r file; do
+    [[ -n "$file" ]] && log "  - $file"
+  done
+  
+  # Extract unique parent directories from changed files
+  local -A pkgs_dirs icons_dirs
+  
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    
+    case "$file" in
+      deployment/pkgsinfo/*)
+        # Extract parent directory (e.g., deployment/pkgsinfo/mgmt/file.yaml → mgmt)
+        parent_dir=$(dirname "$file" | sed 's|^deployment/pkgsinfo/||' | cut -d'/' -f1)
+        if [[ -n "$parent_dir" && "$parent_dir" != "." ]]; then
+          pkgs_dirs[$parent_dir]=1
+          log "Will sync pkgs/$parent_dir (pkgsinfo change: $file)"
+        fi
+        ;;
+      deployment/pkgs/*)
+        # Extract parent directory from pkgs path
+        parent_dir=$(dirname "$file" | sed 's|^deployment/pkgs/||' | cut -d'/' -f1)
+        if [[ -n "$parent_dir" && "$parent_dir" != "." ]]; then
+          pkgs_dirs[$parent_dir]=1
+          log "Will sync pkgs/$parent_dir (direct pkgs change: $file)"
+        fi
+        ;;
+      deployment/icons/*)
+        # For icons, extract subdirectory or use root
+        parent_dir=$(dirname "$file" | sed 's|^deployment/icons/||' | cut -d'/' -f1)
+        if [[ "$parent_dir" == "." || -z "$parent_dir" ]]; then
+          icons_dirs["root"]=1
+          log "Will sync icons/ (change: $file)"
+        else
+          icons_dirs[$parent_dir]=1
+          log "Will sync icons/$parent_dir (change: $file)"
+        fi
+        ;;
+      *)
+        log "Ignoring version-controlled file: $file"
+        ;;
+    esac
+  done <<< "$changed_files"
+  
+  # Build output list (bash associative array keys)
+  local output=""
+  for dir in "${!pkgs_dirs[@]}"; do
+    output+="pkgs/$dir"$'\n'
+  done
+  for dir in "${!icons_dirs[@]}"; do
+    if [[ "$dir" == "root" ]]; then
+      output+="icons"$'\n'
+    else
+      output+="icons/$dir"$'\n'
+    fi
+  done
+  
+  # Remove trailing newline and empty lines
+  output=$(echo -n "$output" | sed '/^$/d')
+  
+  if [[ -z "$output" ]]; then
+    log "No binary files need syncing (only version-controlled files changed)"
+    echo "none"
+  else
+    echo "$output"
+  fi
+}
+
+# ── targeted path upload (for specific files) ────────────────────────────────
+# This runs BEFORE branch gate since it's explicitly requested
+if [[ ${#TARGET_PATHS[@]} -gt 0 ]]; then
+  log ">> targeted path upload - uploading ${#TARGET_PATHS[@]} specific path(s)"
+  
+  check_azure_auth
+  export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
+  
+  for target_path in "${TARGET_PATHS[@]}"; do
+    # Normalize path - ensure it starts with deployment/pkgs/
+    if [[ "$target_path" != deployment/* ]]; then
+      target_path="deployment/pkgs/$target_path"
+    fi
+    
+    log "  → uploading: $target_path"
+    
+    # Use azcopy copy for single file upload
+    "$AZCOPY" copy "$REPO_ROOT/$target_path" "$STORAGE_URL/$target_path" \
+      --log-level="ERROR" --output-level="essential" 2>&1 | tee -a "$LOGFILE" || true
+  done
+  
+  log 'Targeted path upload complete'
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# ── branch gating ───────────────────────────────────────────────────────────
+current_branch=$(git symbolic-ref --quiet --short HEAD || true)
+
+if [[ "$current_branch" != "main" ]]; then
+  log "Skipping uploads – we are in branch '$current_branch', not main."
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0          # allow push to proceed with no upload
+fi
+
+# ── safety guard (main only) ────────────────────────────────────────────────
+git fetch --quiet origin main 2>/dev/null || true
+
+behind=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+
+if (( behind > 0 )); then
+  log "Local main is $behind commit(s) behind origin/main – running git pull first"
+
+  if git pull --ff-only origin main; then
+    log "Git Pull with fast-forward successful – now at $(git rev-parse --short HEAD)"
+  else
+    log "Push cancelled: local main is missing commits from origin/main and needs a manual merge or rebase."
+    exit 1
+  fi
+fi
+
+log "On branch 'main' – checking for changes"
+
+# ── makecatalogs validation (ensure no missing packages before push) ────────
+DEPLOYMENT="$REPO_ROOT/deployment"
+DIALOG="/usr/local/bin/dialog"
+
+# Check for makecatalogs
+if ! command -v makecatalogs &>/dev/null; then
+  log "WARNING: makecatalogs not found, skipping pkgsinfo validation"
+else
+  log "Running makecatalogs to validate pkgsinfo..."
+  
+  MAKECATALOGS_OUTPUT=$(mktemp)
+  MAKECATALOGS_EXIT=0
+  
+  makecatalogs --silent "$DEPLOYMENT" > "$MAKECATALOGS_OUTPUT" 2>&1 || MAKECATALOGS_EXIT=$?
+  cat "$MAKECATALOGS_OUTPUT" >> "$LOGFILE"
+  
+  # Check for parse errors
+  PARSE_ERRORS=$(grep -E "Unexpected error reading" "$MAKECATALOGS_OUTPUT" || true)
+  
+  if [[ -n "$PARSE_ERRORS" ]]; then
+    ERROR_FILES=$(echo "$PARSE_ERRORS" | sed 's/.*Unexpected error reading \(.*\):.*/\1/')
+    log "PUSH BLOCKED: Parse errors in pkgsinfo files"
+    log "$ERROR_FILES"
+    
+    if [[ -x "$DIALOG" ]]; then
+      "$DIALOG" \
+        --title "Push Blocked: Parse Errors" \
+        --icon "SF=xmark.circle.fill,palette=white,red,red" \
+        --iconsize 80 \
+        --message "Cannot push - malformed pkgsinfo files detected:\n\n$ERROR_FILES\n\nPlease fix the YAML/plist syntax errors first." \
+        --button1text "OK" \
+        --width 600 \
+        --height 300 \
+        --moveable \
+        --ontop
+    fi
+    
+    rm -f "$MAKECATALOGS_OUTPUT"
+    mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+    exit 1
+  fi
+  
+  # Check for missing packages
+  MISSING_PKGS=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
+  
+  if [[ -n "$MISSING_PKGS" ]]; then
+    WARNING_COUNT=$(echo "$MISSING_PKGS" | wc -l | tr -d ' ')
+    log "Found $WARNING_COUNT missing package(s). Attempting auto-download from Azure..."
+    
+    # Extract the missing package paths for targeted download
+    MISSING_PKG_PATHS=()
+    while IFS= read -r line; do
+      pkg_path=$(echo "$line" | sed 's/.*refers to missing installer item: //')
+      MISSING_PKG_PATHS+=("$pkg_path")
+    done <<< "$MISSING_PKGS"
+    
+    # Build the --path arguments for targeted download
+    PATH_ARGS=()
+    for pkg_path in "${MISSING_PKG_PATHS[@]}"; do
+      PATH_ARGS+=(--path "$pkg_path")
+    done
+    
+    if [[ -x "$DIALOG" ]]; then
+      WARNING_LIST=$(echo "$MISSING_PKGS" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
+      if [[ $WARNING_COUNT -gt 10 ]]; then
+        WARNING_LIST="${WARNING_LIST}\n\n...and $((WARNING_COUNT - 10)) more"
+      fi
+      
+      DIALOG_CMD=$(mktemp)
+      
+      "$DIALOG" \
+        --title "Pre-Push: Downloading Missing Packages" \
+        --icon "SF=arrow.down.circle.fill,palette=white,blue,blue" \
+        --iconsize 80 \
+        --message "**${WARNING_COUNT}** package(s) missing locally.\n\nDownloading from Azure before push...\n\n${WARNING_LIST}" \
+        --progress 100 \
+        --progresstext "Connecting to Azure..." \
+        --width 600 \
+        --height 600 \
+        --moveable \
+        --ontop \
+        --commandfile "$DIALOG_CMD" &
+      DIALOG_PID=$!
+      sleep 0.5
+      
+      echo "progress: 10" >> "$DIALOG_CMD"
+      CURRENT_PKG=0
+      
+      # Call post-merge hook for downloads
+      POST_MERGE_HOOK="$REPO_ROOT/.githooks/post-merge"
+      if [[ -x "$POST_MERGE_HOOK" ]]; then
+        "$POST_MERGE_HOOK" "${PATH_ARGS[@]}" 2>&1 | while IFS= read -r line; do
+          echo "$line" | tee -a "$LOGFILE"
+          if [[ "$line" == *"-> syncing:"* ]]; then
+            CURRENT_PKG=$((CURRENT_PKG + 1))
+            PROGRESS=$(( 10 + (80 * CURRENT_PKG / ${#MISSING_PKG_PATHS[@]}) ))
+            PKG_NAME=$(echo "$line" | sed 's/.*-> syncing: //' | sed 's/deployment\/pkgs\///')
+            echo "progress: $PROGRESS" >> "$DIALOG_CMD"
+            echo "progresstext: Downloading: $PKG_NAME" >> "$DIALOG_CMD"
+          fi
+        done
+      fi
+      
+      echo "progress: 100" >> "$DIALOG_CMD"
+      echo "progresstext: Download complete!" >> "$DIALOG_CMD"
+      sleep 0.5
+      echo "quit:" >> "$DIALOG_CMD"
+      wait $DIALOG_PID 2>/dev/null || true
+      rm -f "$DIALOG_CMD"
+    else
+      # No dialog, just run the download
+      POST_MERGE_HOOK="$REPO_ROOT/.githooks/post-merge"
+      if [[ -x "$POST_MERGE_HOOK" ]]; then
+        "$POST_MERGE_HOOK" "${PATH_ARGS[@]}" 2>&1 | tee -a "$LOGFILE"
+      fi
+    fi
+    
+    # Re-validate with makecatalogs
+    log "Re-validating pkgsinfo after download..."
+    rm -f "$MAKECATALOGS_OUTPUT"
+    MAKECATALOGS_OUTPUT=$(mktemp)
+    makecatalogs --silent "$DEPLOYMENT" > "$MAKECATALOGS_OUTPUT" 2>&1
+    cat "$MAKECATALOGS_OUTPUT" >> "$LOGFILE"
+    
+    MISSING_PKGS_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
+    
+    if [[ -n "$MISSING_PKGS_RECHECK" ]]; then
+      STILL_MISSING=$(echo "$MISSING_PKGS_RECHECK" | wc -l | tr -d ' ')
+      log "PUSH BLOCKED: $STILL_MISSING package(s) still missing after download"
+      
+      if [[ -x "$DIALOG" ]]; then
+        STILL_LIST=$(echo "$MISSING_PKGS_RECHECK" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
+        
+        "$DIALOG" \
+          --title "Push Blocked: Missing Packages" \
+          --icon "SF=xmark.circle.fill,palette=white,red,red" \
+          --iconsize 80 \
+          --message "After syncing from Azure, **${STILL_MISSING}** package(s) are still missing.\n\nThese packages don't exist locally or in Azure:\n\n${STILL_LIST}\n\nBuild/add the .pkg files first, or fix the pkgsinfo references." \
+          --button1text "OK" \
+          --width 700 \
+          --height 450 \
+          --moveable \
+          --ontop
+      fi
+      
+      rm -f "$MAKECATALOGS_OUTPUT"
+      mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+      exit 1
+    fi
+    
+    log "All missing packages downloaded successfully"
+  fi
+  
+  rm -f "$MAKECATALOGS_OUTPUT"
+fi
+
+# ── change detection and selective sync ────────────────────
+changed_paths=$(detect_changes)
+
+if [[ "$changed_paths" == "none" ]]; then
+  log "No sync needed"
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# ── Azure authentication ───────────────────────────────────
+check_azure_auth
+
+# ── cleanup temporary azcopy files ─────────────────────────
+cleanup_temp_files() {
+  find "$REPO_ROOT" -name ".azDownload*" -type f -delete 2>/dev/null || true
+}
+
+trap cleanup_temp_files EXIT
+
+log "On branch 'main' – syncing specific directories"
+
+export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
+
+# If force sync, sync everything
+if [[ "$changed_paths" == "all" ]]; then
+  log '>> syncing ALL deployment/ (force mode)'
+  
+  "$AZCOPY" sync "$REPO_ROOT/deployment" "$STORAGE_URL/deployment/" \
+    --delete-destination=true --exclude-pattern="*.DS_Store" \
+    --exclude-pattern="catalogs*" --exclude-pattern="manifests*" \
+    --log-level="INFO" --output-level="essential" | tee -a "$LOGFILE"
+  
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# If upload/sync mode, use hash-based sync for all pkgs
+if [[ "$changed_paths" == "upload" ]]; then
+  log '>> syncing deployment/pkgs (hash-based, with orphan cleanup)'
+  
+  "$AZCOPY" sync "$REPO_ROOT/deployment/pkgs" "$STORAGE_URL/deployment/pkgs/" \
+    --delete-destination=false --exclude-pattern="*.DS_Store" --compare-hash=MD5 \
+    --log-level="INFO" --output-level="essential" | tee -a "$LOGFILE"
+  
+  cleanup_azure_orphans
+  
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 0
+fi
+
+# Process each specific directory
+while IFS= read -r path; do
+  [[ -z "$path" ]] && continue
+  
+  case "$path" in
+    pkgs/*)
+      subdir="${path#pkgs/}"
+      log ">> syncing deployment/pkgs/$subdir (hash-based, targeted)"
+      
+      # Sync the specific subdirectory
+      "$AZCOPY" sync "$REPO_ROOT/deployment/pkgs/$subdir" "$STORAGE_URL/deployment/pkgs/$subdir/" \
+        --delete-destination=false --exclude-pattern="*.DS_Store" --compare-hash=MD5 \
+        --log-level="INFO" --output-level="essential" | tee -a "$LOGFILE"
+      
+      # Cleanup orphans in this subdirectory only
+      log "  → checking for orphaned packages in pkgs/$subdir"
+      
+      # Build canonical list for this subdirectory
+      canonical_list=$(mktemp)
+      azure_list=$(mktemp)
+      
+      # Get packages referenced by pkgsinfo in this subdirectory
+      find "$REPO_ROOT/deployment/pkgsinfo/$subdir" -type f \( -name "*.yaml" -o -name "*.plist" \) 2>/dev/null | while IFS= read -r pkgsinfo; do
+        extract_location_from_pkgsinfo "$pkgsinfo" | grep "^pkgs/$subdir/" | sed 's|^pkgs/||'
+      done | sort -u > "$canonical_list"
+      
+      # Get packages in Azure for this subdirectory
+      "$AZCOPY" list "$STORAGE_URL/deployment/pkgs/$subdir/" --output-type=json 2>/dev/null | \
+        jq -r '.[] | select(.Path != null and (.Path | test("\\.(pkg|dmg)$"))) | .Path' | \
+        sed "s|^$subdir/||" | sort -u > "$azure_list" || true
+      
+      # Find orphans
+      orphans=$(comm -13 "$canonical_list" "$azure_list")
+      
+      if [[ -n "$orphans" ]]; then
+        echo "$orphans" | while IFS= read -r orphan; do
+          [[ -z "$orphan" ]] && continue
+          log "  → removing orphan: pkgs/$subdir/$orphan"
+          "$AZCOPY" remove "$STORAGE_URL/deployment/pkgs/$subdir/$orphan" \
+            --log-level="ERROR" --output-level="quiet" 2>&1 | tee -a "$LOGFILE" || true
+        done
+      else
+        log "  → no orphans found in pkgs/$subdir"
+      fi
+      
+      rm -f "$canonical_list" "$azure_list"
+      ;;
+    
+    icons/*|icons)
+      if [[ "$path" == "icons" ]]; then
+        log ">> syncing deployment/icons/ (hash-based)"
+        "$AZCOPY" sync "$REPO_ROOT/deployment/icons" "$STORAGE_URL/deployment/icons/" \
+          --delete-destination=true --exclude-pattern="*.DS_Store" --compare-hash=MD5 \
+          --log-level="INFO" --output-level="essential" | tee -a "$LOGFILE"
+      else
+        subdir="${path#icons/}"
+        log ">> syncing deployment/icons/$subdir (hash-based)"
+        "$AZCOPY" sync "$REPO_ROOT/deployment/icons/$subdir" "$STORAGE_URL/deployment/icons/$subdir/" \
+          --delete-destination=true --exclude-pattern="*.DS_Store" --compare-hash=MD5 \
+          --log-level="INFO" --output-level="essential" | tee -a "$LOGFILE"
+      fi
+      ;;
+  esac
+done <<< "$changed_paths"
+
+log 'pre-push completed'
+mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
