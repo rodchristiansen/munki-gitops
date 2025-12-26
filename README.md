@@ -1,12 +1,8 @@
-# Modern Munki DevOps
+# Running Munki under DevOps model
 
 **MacDevOps YVR 2025 presentation Companion Repo** - [YouTube link](https://www.youtube.com/watch?v=ayQqGT9S_cM&t=6s&pp=ygUQcm9kIGNocmlzdGlhbnNlbg%3D%3D)
 
-A year ago, we were managing Macs the way most orgs still do: one shared Mac, VNC’d into, running a local copy of Munki with no real version control or workflow isolation. Git was an afterthought. Deployments were manual. It worked—until it didn’t scale.
-
-We’ve since inverted the model. Git is the gate. CI is the deployer. Each admin works from their own machine. And the Munki repo is fully DevOps-native.
-
-Here's how we rebuilt everything using Git, CI/CD pipelines, message queues, local caching servers, and inventory automation—all open source and cloud-integrated.
+Repo has samples of how we rebuilt our Munki ops to be fully Git with hooks, CI/CD pipelines, message queues, and local caching servers.
 
 **Cloud Provider Options**: This repo includes implementations for both **Azure** (Azure DevOps, Azure Storage, Service Bus) and **AWS** (GitHub Actions/CodePipeline, S3, SQS/SNS). Choose the cloud provider that fits your infrastructure.
 
