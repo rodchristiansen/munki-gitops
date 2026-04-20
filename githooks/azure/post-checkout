@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# HOOK_VERSION=2026.04.19
+#
+# ──────────────────────────────────────────────────────────────────────────────
+#  post-checkout hook  –  per-admin fresh-clone setup (Azure)
+#
+#  This is a SCAFFOLD showing where org-specific setup belongs. Typical work:
+#    - Worktree cache linking (handled by lib/common.sh — always).
+#    - Hook version check (handled by lib/common.sh — always).
+#    - Fetch secrets from Azure Key Vault:
+#         az keyvault secret show --vault-name "$VAULT" --name … --query value -o tsv
+#      and write them to terraform.tfvars / local.settings.json / .env files
+#      that your local dev tooling expects.
+#    - Install local CLI tools the admin needs.
+#
+#  This hook is intentionally minimal — secrets management is org-specific.
+#  Fork it and add your Key Vault fetches, .env writes, and tool installs.
+#
+#  Runs on fresh clone and on every branch switch.
+#  Manual run: ./githooks/azure/post-checkout --force
+#
+#  Env bypass: GIT_NO_VERIFY, SKIP_MUNKI_HOOKS, DISABLE_CUSTOM_HOOKS
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$HOOK_DIR/../lib/common.sh"
+
+check_hook_version "post-checkout" "2026.04.19"
+should_skip_hook "post-checkout" && exit 0
+link_worktree_sync_caches
+
+# Enforce rebase-based pull strategy — keeps history linear and plays better
+# with submodule-branch restore, if your repo uses submodules.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+git -C "$REPO_ROOT" config pull.rebase true 2>/dev/null || true
+
+# ── Secrets scaffold (replace with your org's Key Vault fetches) ───────────
+# Example pattern — comment out or customise for your environment.
+#
+# FORCE_RUN=false
+# [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]] && FORCE_RUN=true
+#
+# VAULT_NAME="${MUNKI_KEY_VAULT_NAME:-your-vault-name}"
+# TFVARS="$REPO_ROOT/infrastructure/terraform.tfvars"
+# LOCAL_SETTINGS="$REPO_ROOT/functions/local.settings.json"
+#
+# # Skip unless forced or files missing
+# if [[ "$FORCE_RUN" != "true" && -f "$TFVARS" && -f "$LOCAL_SETTINGS" ]]; then
+#   exit 0
+# fi
+#
+# if ! command -v az &>/dev/null; then
+#   echo "Azure CLI not installed; skipping secrets bootstrap. (brew install azure-cli)" >&2
+#   exit 0
+# fi
+#
+# # Fetch a secret
+# get_secret() {
+#   az keyvault secret show --vault-name "$VAULT_NAME" --name "$1" --query "value" -o tsv 2>/dev/null || echo ""
+# }
+#
+# MUNKI_USERNAME=$(get_secret "MunkiUsername")
+# MUNKI_PASSWORD=$(get_secret "MunkiPassword")
+# AZURE_STORAGE_CONNECTION_STRING=$(get_secret "AzureStorageConnectionString")
+#
+# # Write config files your dev tooling reads
+# cat > "$TFVARS" <<EOF
+# munki_username = "$MUNKI_USERNAME"
+# munki_password = "$MUNKI_PASSWORD"
+# azure_storage_connection_string = "$AZURE_STORAGE_CONNECTION_STRING"
+# EOF
+#
+# cat > "$LOCAL_SETTINGS" <<EOF
+# {
+#   "IsEncrypted": false,
+#   "Values": {
+#     "AzureWebJobsStorage": "$AZURE_STORAGE_CONNECTION_STRING",
+#     "FUNCTIONS_WORKER_RUNTIME": "python"
+#   }
+# }
+# EOF
+exit 0

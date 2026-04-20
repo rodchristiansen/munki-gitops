@@ -1,15 +1,33 @@
 #!/usr/bin/env bash
+# HOOK_VERSION=2026.04.19
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-commit hook  –  validates Munki pkgsinfo before committing (Azure)
 #
-#  Runs makecatalogs and catches:
-#    1. Parse errors (malformed XML/YAML) → blocks commit with dialog alert
-#    2. Missing pkg warnings → attempts auto-download, blocks if still missing
+#  Guards applied, in order:
+#    1. Hook version check (warns if stale)
+#    2. Env bypass (GIT_NO_VERIFY, SKIP_MUNKI_HOOKS, etc.)
+#    3. Concurrency lock (prevents overlap with pre-push)
+#    4. Binary-size guard (>50MB outside deployment/pkgs | deployment/icons)
+#    5. Worktree cache link (no-op in primary)
+#    6. Structural pkgsinfo linter (typos, invalid enums, install loops)
+#    7. makecatalogs validation (parse errors, missing keys, invalid locations)
+#    8. Missing-pkg auto-download from Azure (batched)
+#    9. Orphan pkg cleanup (main only, capped at 10)
 #
 #  Uses swiftDialog for user-friendly error notifications (optional).
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$HOOK_DIR/../lib/common.sh"
+
+check_hook_version "pre-commit" "2026.04.19"
+should_skip_hook "pre-commit" && exit 0
+link_worktree_sync_caches
+acquire_hook_lock "pre-commit" || exit 1
+check_staged_binary_sizes || exit 1
 
 # ── Configuration ──────────────────────────────────────────
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
@@ -18,6 +36,8 @@ if [[ -z "$REPO_ROOT" ]]; then
 fi
 DEPLOYMENT="$REPO_ROOT/deployment"
 DIALOG="/usr/local/bin/dialog"
+LINT_SCRIPT="$HOOK_DIR/../lib/pkgsinfo-lint.py"
+ORPHAN_DELETION_CAP="${MUNKI_ORPHAN_DELETION_CAP:-10}"
 
 # ── check for makecatalogs ─────────────────────────────────
 if ! command -v makecatalogs &>/dev/null; then
@@ -28,8 +48,33 @@ fi
 
 # ── check for dialog (optional) ────────────────────────────
 USE_DIALOG=false
-if [[ -x "$DIALOG" ]]; then
-  USE_DIALOG=true
+[[ -x "$DIALOG" ]] && USE_DIALOG=true
+
+# ── M1: structural pkgsinfo linter ─────────────────────────
+# Runs before makecatalogs so typos and schema errors get friendly messages
+# instead of makecatalogs' opaque stack traces.
+if [[ -x "$LINT_SCRIPT" ]] && command -v python3 >/dev/null 2>&1; then
+  LINT_OUTPUT=$(mktemp)
+  LINT_EXIT=0
+  python3 "$LINT_SCRIPT" "$REPO_ROOT" 2> "$LINT_OUTPUT" || LINT_EXIT=$?
+  cat "$LINT_OUTPUT" >&2 || true
+
+  if [[ $LINT_EXIT -ne 0 ]]; then
+    if [[ "$USE_DIALOG" == "true" ]]; then
+      LINT_REPORT=$(cat "$LINT_OUTPUT")
+      "$DIALOG" \
+        --title "Commit Blocked: pkgsinfo Structural Errors" \
+        --icon "SF=exclamationmark.triangle.fill,palette=white,red,red" \
+        --iconsize 80 \
+        --message "Static validation caught structural issues:\n\n\`\`\`\n${LINT_REPORT}\n\`\`\`" \
+        --button1text "OK" \
+        --messagefont "size=12" \
+        --width 780 --height 560 --moveable || true
+    fi
+    rm -f "$LINT_OUTPUT"
+    exit 1
+  fi
+  rm -f "$LINT_OUTPUT"
 fi
 
 # ── run makecatalogs and capture output ────────────────────
@@ -40,48 +85,91 @@ MAKECATALOGS_EXIT=0
 
 makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT" || MAKECATALOGS_EXIT=$?
 
-# ── check for parse errors (Unexpected error) ──────────────
+# ── check for parse errors ─────────────────────────────────
 PARSE_ERRORS=$(grep -E "Unexpected error reading" "$MAKECATALOGS_OUTPUT" || true)
 
 if [[ -n "$PARSE_ERRORS" ]]; then
-  ERROR_FILES=$(echo "$PARSE_ERRORS" | sed 's/.*Unexpected error reading \([^:]*\):.*/\1/' | tr '\n' '\n' | sort -u)
+  ERROR_FILES=$(echo "$PARSE_ERRORS" | sed 's/.*Unexpected error reading \([^:]*\):.*/\1/' | sort -u)
   ERROR_COUNT=$(echo "$ERROR_FILES" | wc -l | tr -d ' ')
-  
-  if echo "$PARSE_ERRORS" | grep -q "Unexpected character"; then
-    PLIST_ERROR=$(echo "$PARSE_ERRORS" | grep -o 'Unexpected character [^"]*' | head -1)
-  elif echo "$PARSE_ERRORS" | grep -q "NSDebugDescription="; then
-    PLIST_ERROR=$(echo "$PARSE_ERRORS" | grep -o 'NSDebugDescription=[^,}]*' | head -1 | sed 's/NSDebugDescription=//')
-  else
-    PLIST_ERROR=""
-  fi
-  
   ERROR_LIST=$(echo "$ERROR_FILES" | sed 's/^/• /')
-  
-  if [[ -n "$PLIST_ERROR" ]]; then
-    ERROR_MSG="**Parse Error:** ${PLIST_ERROR}\n\n**Affected file(s):**\n${ERROR_LIST}"
-  else
-    ERROR_MSG="**Affected file(s):**\n${ERROR_LIST}"
-  fi
-  
+
   if [[ "$USE_DIALOG" == "true" ]]; then
     "$DIALOG" \
       --title "Commit Blocked: malformed pkgsinfo" \
       --icon "SF=xmark.circle.fill,palette=white,red,red" \
       --iconsize 80 \
-      --message "**makecatalogs** found **${ERROR_COUNT}** pkgsinfo file(s) that cannot be parsed.\n\n${ERROR_MSG}" \
+      --message "**makecatalogs** found **${ERROR_COUNT}** pkgsinfo file(s) that cannot be parsed.\n\n${ERROR_LIST}" \
       --button1text "OK" \
-      --messagefont "size=14" \
-      --width 700 \
-      --height 400 \
-      --moveable \
-      --ontop
+      --messagefont "size=14" --width 700 --height 400 --moveable || true
   fi
-  
+
   rm -f "$MAKECATALOGS_OUTPUT"
   echo ""
-  echo "COMMIT BLOCKED: Fix the parse error(s) above before committing."
+  echo "COMMIT BLOCKED: Fix parse error(s) before committing."
   echo "$ERROR_FILES"
   exit 1
+fi
+
+# ── M2 + M3: orphan pkg cleanup (main/master only, capped) ─
+# Run BEFORE missing-pkg handling so we don't try to download pkgs we're
+# about to delete anyway.
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
+  PKGS_DIR="$DEPLOYMENT/pkgs"
+  PKGSINFO_DIR="$DEPLOYMENT/pkgsinfo"
+  if [[ -d "$PKGS_DIR" && -d "$PKGSINFO_DIR" ]]; then
+    CANONICAL_FILE=$(mktemp)
+    # YAML pkgsinfo
+    grep -rhE '^[[:space:]]*installer_item_location:[[:space:]]*' "$PKGSINFO_DIR" \
+      --include="*.yaml" --include="*.yml" 2>/dev/null | \
+      sed -E 's/^[[:space:]]*installer_item_location:[[:space:]]*//' | \
+      tr -d '"'"'" | sed 's/^[[:space:]]*//' >> "$CANONICAL_FILE" || true
+    # Plist pkgsinfo (including extensionless)
+    grep -rhA1 '<key>installer_item_location</key>' "$PKGSINFO_DIR" 2>/dev/null | \
+      grep '<string>' | sed -E 's/.*<string>(.*)<\/string>.*/\1/' >> "$CANONICAL_FILE" || true
+    sort -u -o "$CANONICAL_FILE" "$CANONICAL_FILE"
+
+    ORPHANS=()
+    while IFS= read -r -d '' pkg_file; do
+      rel_path="${pkg_file#$PKGS_DIR/}"
+      if ! grep -qxF "$rel_path" "$CANONICAL_FILE" 2>/dev/null; then
+        ORPHANS+=("$rel_path")
+      fi
+    done < <(find "$PKGS_DIR" -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.zip" -o -name "*.mobileconfig" \) -print0 2>/dev/null)
+
+    ORPHAN_COUNT=${#ORPHANS[@]}
+    rm -f "$CANONICAL_FILE"
+
+    if (( ORPHAN_COUNT > ORPHAN_DELETION_CAP )); then
+      echo ""
+      echo "COMMIT BLOCKED: ${ORPHAN_COUNT} orphan package(s) found (cap is ${ORPHAN_DELETION_CAP})."
+      echo "This is unusual — possible causes:"
+      echo "  • Partial pkgsinfo set (branch switch in progress)"
+      echo "  • Stale local pkgs from a prior branch"
+      echo "  • YAML parse errors masking installer_item_location"
+      echo ""
+      echo "Sample orphans (first 15):"
+      for o in "${ORPHANS[@]:0:15}"; do echo "  • $o"; done
+      (( ORPHAN_COUNT > 15 )) && echo "  ... and $((ORPHAN_COUNT - 15)) more"
+      echo ""
+      echo "If genuinely orphaned, delete manually and retry:"
+      echo "  (cd $PKGS_DIR && rm <relative-path>)"
+      exit 1
+    fi
+
+    if (( ORPHAN_COUNT > 0 )); then
+      echo ""
+      echo "Found ${ORPHAN_COUNT} orphan package(s) — cleaning up:"
+      for o in "${ORPHANS[@]}"; do
+        echo "  • $o"
+        rm -f "$PKGS_DIR/$o"
+      done
+      find "$PKGS_DIR" -type d -empty -delete 2>/dev/null || true
+      echo ""
+    fi
+  fi
+else
+  echo "[pre-commit] Skipping orphan cleanup (branch '$CURRENT_BRANCH' is not main/master)."
 fi
 
 # ── check for missing pkg warnings ─────────────────────────
@@ -89,128 +177,80 @@ MISSING_PKGS=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATAL
 
 if [[ -n "$MISSING_PKGS" ]]; then
   WARNING_COUNT=$(echo "$MISSING_PKGS" | wc -l | tr -d ' ')
-  
+
   MISSING_PKG_PATHS=()
   while IFS= read -r line; do
     pkg_path=$(echo "$line" | sed 's/.*refers to missing installer item: //')
     MISSING_PKG_PATHS+=("$pkg_path")
   done <<< "$MISSING_PKGS"
-  
-  WARNING_LIST=$(echo "$MISSING_PKGS" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
-  
-  if [[ $WARNING_COUNT -gt 10 ]]; then
-    WARNING_LIST="${WARNING_LIST}\n\n...and $((WARNING_COUNT - 10)) more"
+
+  # ── safety gate: cap auto-downloads relative to staged pkgsinfo ─────
+  STAGED_PKGSINFO_COUNT=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null \
+    | grep -cE '^deployment/pkgsinfo/.*\.(yaml|yml)$' || true)
+  STAGED_PKGSINFO_COUNT=${STAGED_PKGSINFO_COUNT:-0}
+  MAX_AUTO_DOWNLOAD=$(( STAGED_PKGSINFO_COUNT * 5 ))
+  (( MAX_AUTO_DOWNLOAD < 25 )) && MAX_AUTO_DOWNLOAD=25
+
+  if (( WARNING_COUNT > MAX_AUTO_DOWNLOAD )); then
+    echo ""
+    echo "COMMIT CANCELLED: ${WARNING_COUNT} missing packages exceeds safe auto-download limit (${MAX_AUTO_DOWNLOAD})."
+    echo "  Run: githooks/azure/post-merge --sync"
+    exit 1
   fi
-  
+
   echo ""
-  echo "Found ${WARNING_COUNT} missing package(s). Automatically downloading from Azure..."
-  
+  echo "Found ${WARNING_COUNT} missing package(s). Downloading from Azure..."
+
   PATH_ARGS=()
   for pkg_path in "${MISSING_PKG_PATHS[@]}"; do
     PATH_ARGS+=(--path "$pkg_path")
   done
-  
-  POST_MERGE_HOOK="$REPO_ROOT/.githooks/post-merge"
-  if [[ ! -x "$POST_MERGE_HOOK" ]]; then
-    POST_MERGE_HOOK="$REPO_ROOT/githooks/azure/post-merge"
-  fi
-  
-  if [[ "$USE_DIALOG" == "true" ]]; then
-    DIALOG_CMD=$(mktemp)
-    SYNC_LOG=$(mktemp)
-    
-    "$DIALOG" \
-      --title "Downloading Missing Packages" \
-      --icon "SF=arrow.down.circle.fill,palette=white,blue,blue" \
-      --iconsize 80 \
-      --message "**${WARNING_COUNT}** package(s) missing locally.\n\nDownloading specific files from Azure Blob Storage...\n\n${WARNING_LIST}" \
-      --progress 100 \
-      --progresstext "Connecting to Azure..." \
-      --width 600 \
-      --height 600 \
-      --moveable \
-      --ontop \
-      --commandfile "$DIALOG_CMD" &
-    DIALOG_PID=$!
-    sleep 0.5
-    
-    echo "progress: 10" >> "$DIALOG_CMD"
-    echo "progresstext: Authenticating with Azure..." >> "$DIALOG_CMD"
-    
-    CURRENT_PKG=0
-    if [[ -x "$POST_MERGE_HOOK" ]]; then
-      "$POST_MERGE_HOOK" "${PATH_ARGS[@]}" 2>&1 | while IFS= read -r line; do
-        echo "$line" >> "$SYNC_LOG"
-        echo "$line"
-        if [[ "$line" == *"-> syncing:"* ]]; then
-          CURRENT_PKG=$((CURRENT_PKG + 1))
-          PROGRESS=$(( 10 + (80 * CURRENT_PKG / ${#MISSING_PKG_PATHS[@]}) ))
-          PKG_NAME=$(echo "$line" | sed 's/.*-> syncing: //' | sed 's/deployment\/pkgs\///')
-          echo "progress: $PROGRESS" >> "$DIALOG_CMD"
-          echo "progresstext: Downloading: $PKG_NAME" >> "$DIALOG_CMD"
-        elif [[ "$line" == *"Targeted path sync complete"* ]]; then
-          echo "progress: 100" >> "$DIALOG_CMD"
-          echo "progresstext: Download complete!" >> "$DIALOG_CMD"
-        fi
-      done
-    fi
-    
-    sleep 0.5
-    echo "quit:" >> "$DIALOG_CMD"
-    wait $DIALOG_PID 2>/dev/null || true
-    rm -f "$DIALOG_CMD" "$SYNC_LOG"
+
+  # Delegate to post-merge which has batched azcopy + caching-server logic
+  POST_MERGE_HOOK="$HOOK_DIR/post-merge"
+  if [[ -x "$POST_MERGE_HOOK" ]]; then
+    "$POST_MERGE_HOOK" "${PATH_ARGS[@]}"
   else
-    if [[ -x "$POST_MERGE_HOOK" ]]; then
-      "$POST_MERGE_HOOK" "${PATH_ARGS[@]}"
-    else
-      echo "WARNING: post-merge hook not found at $POST_MERGE_HOOK"
-      echo "Cannot auto-download missing packages"
-    fi
+    echo "WARNING: post-merge hook not found at $POST_MERGE_HOOK"
+    echo "Cannot auto-download missing packages"
   fi
-  
+
+  # Re-validate
   echo ""
   echo "Re-validating pkgsinfo after download..."
   rm -f "$MAKECATALOGS_OUTPUT"
   MAKECATALOGS_OUTPUT=$(mktemp)
   makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT"
-  
+
   MISSING_PKGS_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
-  
   if [[ -n "$MISSING_PKGS_RECHECK" ]]; then
     STILL_MISSING=$(echo "$MISSING_PKGS_RECHECK" | wc -l | tr -d ' ')
-    STILL_LIST=$(echo "$MISSING_PKGS_RECHECK" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
-    
+    STILL_LIST=$(echo "$MISSING_PKGS_RECHECK" | sed 's/WARNING: /• /' | head -10)
+
     if [[ "$USE_DIALOG" == "true" ]]; then
       "$DIALOG" \
         --title "Commit Blocked: Missing Packages" \
         --icon "SF=xmark.circle.fill,palette=white,red,red" \
         --iconsize 80 \
-        --message "After syncing from Azure, **${STILL_MISSING}** package(s) are still missing.\n\nThese packages don't exist in Azure Blob Storage:\n\n${STILL_LIST}\n\nYou'll need to:\n• Add the missing .pkg files manually, or\n• Remove/update the pkgsinfo references" \
+        --message "After syncing from Azure, **${STILL_MISSING}** package(s) are still missing.\n\n${STILL_LIST}\n\nEither add the .pkg files manually or fix the pkgsinfo references." \
         --button1text "OK" \
-        --messagefont "size=14" \
-        --width 700 \
-        --height 450 \
-        --moveable \
-        --ontop
+        --messagefont "size=14" --width 700 --height 450 --moveable || true
     fi
-    
+
     rm -f "$MAKECATALOGS_OUTPUT"
-    echo ""
     echo "COMMIT BLOCKED: Some packages are still missing after download."
     exit 1
-  else
-    rm -f "$MAKECATALOGS_OUTPUT"
-    echo ""
-    echo "All missing packages downloaded successfully"
-    echo "pkgsinfo validation passed"
-    exit 0
   fi
+
+  rm -f "$MAKECATALOGS_OUTPUT"
+  echo "All missing packages downloaded successfully"
+  echo "pkgsinfo validation passed"
+  exit 0
 fi
 
 # ── check for makecatalogs exit code ───────────────────────
 if [[ $MAKECATALOGS_EXIT -ne 0 ]]; then
   ERROR_TAIL=$(tail -20 "$MAKECATALOGS_OUTPUT")
-  
   if [[ "$USE_DIALOG" == "true" ]]; then
     "$DIALOG" \
       --title "Commit Blocked: makecatalogs Failed" \
@@ -218,15 +258,9 @@ if [[ $MAKECATALOGS_EXIT -ne 0 ]]; then
       --iconsize 80 \
       --message "**makecatalogs** exited with error code ${MAKECATALOGS_EXIT}.\n\n\`\`\`\n${ERROR_TAIL}\n\`\`\`" \
       --button1text "OK" \
-      --messagefont "size=14" \
-      --width 700 \
-      --height 400 \
-      --moveable \
-      --ontop
+      --messagefont "size=14" --width 700 --height 400 --moveable || true
   fi
-  
   rm -f "$MAKECATALOGS_OUTPUT"
-  echo ""
   echo "COMMIT BLOCKED: makecatalogs failed with exit code $MAKECATALOGS_EXIT"
   exit 1
 fi
