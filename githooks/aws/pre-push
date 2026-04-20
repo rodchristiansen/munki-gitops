@@ -1,91 +1,69 @@
 #!/usr/bin/env bash
+# HOOK_VERSION=2026.04.19
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-push hook  –  safe AWS S3 upload for Munki repo
 #
-#  • Only runs the upload when pushing *main*.
-#      – Any other branch → skip upload, allow push.
-#  • If on main, aborts when behind origin/main (unless it can fast-forward).
-#  • Daily log rotation, smart change detection.
-#  • Supports targeted package sync with --path flag
+#  • Gated to pushing main/master — other branches push freely, no sync.
+#  • Aborts when behind origin (unless fast-forward succeeds).
+#  • Re-runs makecatalogs as a final pre-flight.
+#  • `aws s3 sync --delete` removes S3 objects not present locally.
+#  • S3 orphan cleanup vs committed pkgsinfo after successful sync.
+#
+#  Env bypass: GIT_NO_VERIFY, SKIP_MUNKI_HOOKS, SKIP_PRE_PUSH, DISABLE_CUSTOM_HOOKS
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 set -f
 shopt -s nullglob
 
-# ── Configuration (customize these for your environment) ───
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$HOOK_DIR/../lib/common.sh"
+
+check_hook_version "pre-push" "2026.04.19"
+should_skip_hook "pre-push" && exit 0
+link_worktree_sync_caches
+acquire_hook_lock "pre-push" || exit 1
+check_staged_binary_sizes || exit 1
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
 if [[ -z "$REPO_ROOT" ]]; then
   REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 fi
-
-# AWS S3 configuration - customize these values or set via environment
 S3_BUCKET="${MUNKI_S3_BUCKET:-your-munki-bucket}"
-S3_PREFIX="${MUNKI_S3_PREFIX:-}"  # Optional prefix within bucket
-AWS_REGION="${AWS_REGION:-us-east-1}"
+S3_PREFIX="${MUNKI_S3_PREFIX:-}"
+AWS_REGION="${MUNKI_AWS_REGION:-${AWS_REGION:-us-east-1}}"
 S3_URL="s3://${S3_BUCKET}${S3_PREFIX:+/$S3_PREFIX}"
 
-# ── check for AWS CLI ──────────────────────────────────────
 if ! command -v aws &>/dev/null; then
-  echo "" >&2
-  echo "ERROR: AWS CLI not found" >&2
-  echo "" >&2
-  echo "The pre-push hook needs AWS CLI to upload packages to S3." >&2
-  echo "" >&2
-  echo "To install AWS CLI:" >&2
-  echo "  brew install awscli" >&2
-  echo "" >&2
-  echo "Or download from: https://aws.amazon.com/cli/" >&2
-  echo "" >&2
+  echo "ERROR: aws CLI not found — install with: brew install awscli" >&2
   exit 1
 fi
 
-# ── command line options ───────────────────────────────────
 FORCE_SYNC=false
-TARGET_PKG=""
 DRY_RUN=false
 UPLOAD_SYNC=false
 TARGET_PATHS=()
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --force)
-      FORCE_SYNC=true
-      shift
-      ;;
-    --pkg=*)
-      TARGET_PKG="${1#*=}"
-      shift
-      ;;
-    --path)
-      shift
-      [[ $# -gt 0 ]] && TARGET_PATHS+=("$1")
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=true
-      shift
-      ;;
-    --upload|--sync)
-      UPLOAD_SYNC=true
-      shift
-      ;;
-    *)
-      shift
-      ;;
+    --force)  FORCE_SYNC=true; shift ;;
+    --path)   shift; [[ $# -gt 0 ]] && TARGET_PATHS+=("$1"); shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    --upload|--sync) UPLOAD_SYNC=true; shift ;;
+    *) shift ;;
   esac
 done
 
-# ── logging ────────────────────────────────────────────────────────────────
 LOGDIR="$REPO_ROOT/.git/logs"
 mkdir -p "$LOGDIR"
 TODAY=$(date +%F)
 LOGFILE="$LOGDIR/hook-pre-push-upload-$TODAY.log"
 : >"$LOGFILE"
-find "$LOGDIR" -name 'hook-pre-push-upload-*.log' -mtime +7 -exec rm {} \;
+find "$LOGDIR" -name 'hook-pre-push-upload-*.log' -mtime +7 -exec rm {} \; 2>/dev/null || true
 
 log() {
-  local ts=$(date '+%Y-%m-%d %H:%M:%S')
+  local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
   printf '%s %s\n' "$ts" "$*" | tee -a "$LOGFILE"
 }
 
@@ -99,459 +77,222 @@ next_index() {
   echo $((max+1))
 }
 
-# ── AWS authentication check ───────────────────────────────
 check_aws_auth() {
-  if ! aws sts get-caller-identity &>/dev/null; then
-    log "AWS CLI not authenticated. Please configure credentials first."
-    log "Run 'aws configure' or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY"
+  if ! aws sts get-caller-identity --region "$AWS_REGION" &>/dev/null; then
+    log "AWS CLI not authenticated — run 'aws configure' or 'aws sso login' first."
     exit 1
   fi
 }
 
-# ── pkgsinfo helpers ───────────────────────────────────────
 extract_location_from_pkgsinfo() {
   local pkgsinfo_file="$1"
-  
-  local location=$(grep -E '^installer_item_location:' "$pkgsinfo_file" 2>/dev/null | head -1 | sed 's/^installer_item_location:[[:space:]]*//' | tr -d '"'"'" || true)
-  
+  local location
+  location=$(grep -E '^installer_item_location:' "$pkgsinfo_file" 2>/dev/null | \
+    head -1 | sed 's/^installer_item_location:[[:space:]]*//' | tr -d '"'"'" || true)
   if [[ -z "$location" ]]; then
-    location=$(grep -A1 '<key>installer_item_location</key>' "$pkgsinfo_file" 2>/dev/null | grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/' | head -1 || true)
+    location=$(grep -A1 '<key>installer_item_location</key>' "$pkgsinfo_file" 2>/dev/null | \
+      grep '<string>' | sed 's/.*<string>\(.*\)<\/string>.*/\1/' | head -1 || true)
   fi
-  
   echo "$location"
 }
 
 build_canonical_pkg_list_committed() {
   local pkgsinfo_dir="$REPO_ROOT/deployment/pkgsinfo"
-  local pkg_list=()
-  
-  while IFS= read -r pkgsinfo_file; do
-    [[ -z "$pkgsinfo_file" ]] && continue
-    [[ ! -f "$pkgsinfo_file" ]] && continue
-    
-    local location=$(extract_location_from_pkgsinfo "$pkgsinfo_file")
-    if [[ -n "$location" ]]; then
-      pkg_list+=("$location")
-    fi
-  done < <(find "$pkgsinfo_dir" -type f \( -name "*.yaml" -o -name "*.plist" -o -name "*.pkgsinfo" \) 2>/dev/null)
-  
-  printf '%s\n' "${pkg_list[@]}" | sort -u
+  {
+    grep -rhE '^\s*installer_item_location:\s*' "$pkgsinfo_dir" \
+      --include="*.yaml" --include="*.yml" 2>/dev/null | \
+      sed -E 's/^\s*installer_item_location:\s*//' | tr -d '"'"'" | sed 's/^[[:space:]]*//' || true
+    grep -rhA1 '<key>installer_item_location</key>' "$pkgsinfo_dir" 2>/dev/null | \
+      grep '<string>' | sed -E 's/.*<string>(.*)<\/string>.*/\1/' || true
+  } | sort -u
 }
 
+# ── S3 orphan cleanup ──────────────────────────────────────
 cleanup_s3_orphans() {
-  log "Building canonical package list from committed pkgsinfo files..."
-  
-  local canonical_list_file=$(mktemp)
-  build_canonical_pkg_list_committed > "$canonical_list_file"
-  local canonical_count=$(wc -l < "$canonical_list_file" | tr -d ' ')
-  log "Found $canonical_count packages referenced in committed pkgsinfo"
-  
-  local s3_list_file=$(mktemp)
+  log "Building canonical pkg list from committed pkgsinfo..."
+  local canonical_file; canonical_file=$(mktemp)
+  build_canonical_pkg_list_committed > "$canonical_file"
+  local canonical_count; canonical_count=$(wc -l < "$canonical_file" | tr -d ' ')
+  log "  $canonical_count packages referenced in committed pkgsinfo"
+
+  local s3_list; s3_list=$(mktemp)
+  # List S3 objects under deployment/pkgs/, normalise to relative keys
   aws s3 ls "$S3_URL/deployment/pkgs/" --recursive --region "$AWS_REGION" 2>/dev/null | \
-    awk '{print $4}' | \
-    sed 's|^deployment/pkgs/||' | \
-    sort -u > "$s3_list_file" || true
-  
-  local s3_count=$(wc -l < "$s3_list_file" | tr -d ' ')
-  log "Found $s3_count packages in S3"
-  
-  local orphans_file=$(mktemp)
-  comm -23 "$s3_list_file" "$canonical_list_file" > "$orphans_file"
-  local orphan_count=$(wc -l < "$orphans_file" | tr -d ' ')
-  
-  if [[ $orphan_count -gt 0 ]]; then
-    log "Found $orphan_count orphan packages in S3 to remove:"
-    while IFS= read -r orphan; do
-      [[ -z "$orphan" ]] && continue
-      log "  - $orphan"
-      if [[ "$DRY_RUN" != "true" ]]; then
-        aws s3 rm "$S3_URL/deployment/pkgs/$orphan" --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE" || true
-      fi
-    done < "$orphans_file"
-    log "S3 orphan cleanup complete"
+    awk '{print $4}' | sed 's|^deployment/pkgs/||' | \
+    grep -E '\.(pkg|dmg|zip|mobileconfig)$' | sort -u > "$s3_list" || true
+  local s3_count; s3_count=$(wc -l < "$s3_list" | tr -d ' ')
+  log "  $s3_count objects in S3"
+
+  local orphans; orphans=$(mktemp)
+  comm -23 "$s3_list" "$canonical_file" > "$orphans"
+  local orphan_count; orphan_count=$(wc -l < "$orphans" | tr -d ' ')
+
+  if (( orphan_count > 0 )); then
+    log "Found $orphan_count orphan object(s) in S3:"
+    head -20 "$orphans" | while IFS= read -r o; do log "  - $o"; done
+    (( orphan_count > 20 )) && log "  ... and $((orphan_count - 20)) more"
+
+    if [[ "$DRY_RUN" != "true" ]]; then
+      log "Deleting $orphan_count orphans from S3..."
+      while IFS= read -r o; do
+        [[ -z "$o" ]] && continue
+        aws s3 rm "$S3_URL/deployment/pkgs/$o" --region "$AWS_REGION" --only-show-errors 2>&1 | tee -a "$LOGFILE" || true
+        local lp="$REPO_ROOT/deployment/pkgs/$o"
+        [[ -f "$lp" ]] && rm -f "$lp"
+      done < "$orphans"
+    else
+      log "[DRY RUN] Would delete $orphan_count orphans"
+    fi
   else
-    log "No orphan packages found in S3"
+    log "No orphans in S3"
   fi
-  
-  rm -f "$canonical_list_file" "$s3_list_file" "$orphans_file"
+  rm -f "$canonical_file" "$s3_list" "$orphans"
 }
 
 # ── change detection ───────────────────────────────────────
 detect_changes() {
-  if [[ -n "$TARGET_PKG" ]]; then
-    if [[ -d "$REPO_ROOT/packages/$TARGET_PKG" ]]; then
-      echo "packages/$TARGET_PKG"
-    else
-      log "Package directory '$TARGET_PKG' not found" >&2
-      echo "none"
-    fi
-    return
-  fi
-  
-  if [[ "$FORCE_SYNC" == "true" ]]; then
-    echo "all"
-    return
-  fi
-  
-  if [[ "$UPLOAD_SYNC" == "true" ]]; then
-    echo "upload"
-    return
-  fi
-  
+  if [[ "$FORCE_SYNC" == "true" ]]; then echo "all"; return; fi
+  if [[ "$UPLOAD_SYNC" == "true" ]]; then echo "upload"; return; fi
+
   local remote_ref="origin/$(git symbolic-ref --short HEAD)"
   local changed_files=""
-  
   if git show-ref --verify --quiet "refs/remotes/$remote_ref"; then
     changed_files=$(git diff --name-only "$remote_ref"..HEAD -- deployment/ 2>/dev/null || true)
-    log "Checking changes from $remote_ref to HEAD"
+  elif git rev-parse HEAD~1 >/dev/null 2>&1; then
+    changed_files=$(git diff --name-only HEAD~1 HEAD -- deployment/ 2>/dev/null || true)
   else
-    if git rev-parse HEAD~1 >/dev/null 2>&1; then
-      changed_files=$(git diff --name-only HEAD~1 HEAD -- deployment/ 2>/dev/null || true)
-      log "Checking changes from HEAD~1 to HEAD (no remote tracking)"
-    else
-      log "No previous commit available for change detection. Syncing all."
-      echo "all"
-      return
-    fi
+    echo "all"; return
   fi
-  
-  if [[ -z "$changed_files" ]]; then
-    log "No changes detected in deployment/ directory. Skipping sync."
-    echo "none"
-    return
-  fi
-  
-  log "Changed files detected:"
-  echo "$changed_files" | while IFS= read -r file; do
-    [[ -n "$file" ]] && log "  - $file"
-  done
-  
-  local -A pkgs_dirs icons_dirs
-  
-  while IFS= read -r file; do
-    [[ -z "$file" ]] && continue
-    
-    case "$file" in
-      deployment/pkgsinfo/*)
-        parent_dir=$(dirname "$file" | sed 's|^deployment/pkgsinfo/||' | cut -d'/' -f1)
-        if [[ -n "$parent_dir" && "$parent_dir" != "." ]]; then
-          pkgs_dirs[$parent_dir]=1
-          log "Will sync pkgs/$parent_dir (pkgsinfo change: $file)"
-        fi
-        ;;
-      deployment/pkgs/*)
-        parent_dir=$(dirname "$file" | sed 's|^deployment/pkgs/||' | cut -d'/' -f1)
-        if [[ -n "$parent_dir" && "$parent_dir" != "." ]]; then
-          pkgs_dirs[$parent_dir]=1
-          log "Will sync pkgs/$parent_dir (direct pkgs change: $file)"
-        fi
-        ;;
-      deployment/icons/*)
-        parent_dir=$(dirname "$file" | sed 's|^deployment/icons/||' | cut -d'/' -f1)
-        if [[ "$parent_dir" == "." || -z "$parent_dir" ]]; then
-          icons_dirs["root"]=1
-          log "Will sync icons/ (change: $file)"
-        else
-          icons_dirs[$parent_dir]=1
-          log "Will sync icons/$parent_dir (change: $file)"
-        fi
-        ;;
-      *)
-        log "Ignoring version-controlled file: $file"
-        ;;
-    esac
-  done <<< "$changed_files"
-  
-  local output=""
-  for dir in "${!pkgs_dirs[@]}"; do
-    output+="pkgs/$dir"$'\n'
-  done
-  for dir in "${!icons_dirs[@]}"; do
-    if [[ "$dir" == "root" ]]; then
-      output+="icons"$'\n'
-    else
-      output+="icons/$dir"$'\n'
-    fi
-  done
-  
-  output=$(echo -n "$output" | sed '/^$/d')
-  
-  if [[ -z "$output" ]]; then
-    log "No binary files need syncing (only version-controlled files changed)"
-    echo "none"
-  else
-    echo "$output"
-  fi
+
+  [[ -z "$changed_files" ]] && { echo "none"; return; }
+
+  local paths=""
+  echo "$changed_files" | grep -qE "^deployment/(pkgs|pkgsinfo)/" && paths+="pkgs "
+  echo "$changed_files" | grep -qE "^deployment/icons/" && paths+="icons "
+  paths=$(echo "$paths" | xargs)
+  [[ -z "$paths" ]] && echo "none" || echo "$paths"
 }
 
 # ── targeted path upload ───────────────────────────────────
 if [[ ${#TARGET_PATHS[@]} -gt 0 ]]; then
-  log ">> targeted path upload - uploading ${#TARGET_PATHS[@]} specific path(s)"
-  
+  log ">> targeted path upload — ${#TARGET_PATHS[@]} path(s)"
   check_aws_auth
-  
-  for target_path in "${TARGET_PATHS[@]}"; do
-    if [[ "$target_path" != deployment/* ]]; then
-      target_path="deployment/pkgs/$target_path"
-    fi
-    
-    log "  → uploading: $target_path"
-    
-    aws s3 cp "$REPO_ROOT/$target_path" "$S3_URL/$target_path" \
-      --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE" || true
+  for t in "${TARGET_PATHS[@]}"; do
+    [[ "$t" != deployment/* ]] && t="deployment/pkgs/$t"
+    log "  → uploading: $t"
+    aws s3 cp "$REPO_ROOT/$t" "$S3_URL/$t" --region "$AWS_REGION" --only-show-errors 2>&1 | tee -a "$LOGFILE" || true
   done
-  
   log 'Targeted path upload complete'
   mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
   exit 0
 fi
 
-# ── branch gating ──────────────────────────────────────────
+# ── branch gate ────────────────────────────────────────────
 current_branch=$(git symbolic-ref --quiet --short HEAD || true)
-
-if [[ "$current_branch" != "main" ]]; then
-  log "Skipping uploads – we are in branch '$current_branch', not main."
+if [[ "$current_branch" != "main" && "$current_branch" != "master" ]]; then
+  log "Skipping upload — branch '$current_branch' is not main/master."
   mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
   exit 0
 fi
 
-# ── safety guard ───────────────────────────────────────────
-git fetch --quiet origin main 2>/dev/null || true
-
-behind=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
-
+# ── fast-forward guard ─────────────────────────────────────
+git fetch --quiet origin "$current_branch" 2>/dev/null || true
+behind=$(git rev-list --count HEAD..origin/"$current_branch" 2>/dev/null || echo 0)
 if (( behind > 0 )); then
-  log "Local main is $behind commit(s) behind origin/main – running git pull first"
-
-  if git pull --ff-only origin main; then
-    log "Git Pull with fast-forward successful – now at $(git rev-parse --short HEAD)"
+  log "Local $current_branch is $behind commit(s) behind — pulling with --ff-only"
+  if git pull --ff-only origin "$current_branch"; then
+    log "Fast-forward OK — now at $(git rev-parse --short HEAD)"
   else
-    log "Push cancelled: local main is missing commits from origin/main and needs a manual merge or rebase."
+    log "PUSH CANCELLED: non-FF merge needed. Run: git pull --rebase origin $current_branch"
     exit 1
   fi
 fi
 
-log "On branch 'main' – checking for changes"
+log "On branch '$current_branch' — checking for changes"
 
-# ── makecatalogs validation ────────────────────────────────
+# ── makecatalogs re-validation ─────────────────────────────
 DEPLOYMENT="$REPO_ROOT/deployment"
-DIALOG="/usr/local/bin/dialog"
-
 if ! command -v makecatalogs &>/dev/null; then
-  log "WARNING: makecatalogs not found, skipping pkgsinfo validation"
+  log "WARNING: makecatalogs not found — skipping pkgsinfo validation"
 else
   log "Running makecatalogs to validate pkgsinfo..."
-  
   MAKECATALOGS_OUTPUT=$(mktemp)
-  MAKECATALOGS_EXIT=0
-  
-  makecatalogs --silent "$DEPLOYMENT" > "$MAKECATALOGS_OUTPUT" 2>&1 || MAKECATALOGS_EXIT=$?
-  cat "$MAKECATALOGS_OUTPUT" >> "$LOGFILE"
-  
+  makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT" | tee -a "$LOGFILE"
+
   PARSE_ERRORS=$(grep -E "Unexpected error reading" "$MAKECATALOGS_OUTPUT" || true)
-  
   if [[ -n "$PARSE_ERRORS" ]]; then
-    ERROR_FILES=$(echo "$PARSE_ERRORS" | sed 's/.*Unexpected error reading \(.*\):.*/\1/')
-    log "PUSH BLOCKED: Parse errors in pkgsinfo files"
-    log "$ERROR_FILES"
-    
-    if [[ -x "$DIALOG" ]]; then
-      "$DIALOG" \
-        --title "Push Blocked: Parse Errors" \
-        --icon "SF=xmark.circle.fill,palette=white,red,red" \
-        --iconsize 80 \
-        --message "Cannot push - malformed pkgsinfo files detected:\n\n$ERROR_FILES\n\nPlease fix the YAML/plist syntax errors first." \
-        --button1text "OK" \
-        --width 600 \
-        --height 300 \
-        --moveable \
-        --ontop
-    fi
-    
+    log "PUSH BLOCKED: parse errors in pkgsinfo"
+    log "$PARSE_ERRORS"
     rm -f "$MAKECATALOGS_OUTPUT"
     mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
     exit 1
   fi
-  
+
   MISSING_PKGS=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
-  
   if [[ -n "$MISSING_PKGS" ]]; then
     WARNING_COUNT=$(echo "$MISSING_PKGS" | wc -l | tr -d ' ')
-    log "Found $WARNING_COUNT missing package(s). Attempting auto-download from S3..."
-    
-    MISSING_PKG_PATHS=()
-    while IFS= read -r line; do
-      pkg_path=$(echo "$line" | sed 's/.*refers to missing installer item: //')
-      MISSING_PKG_PATHS+=("$pkg_path")
-    done <<< "$MISSING_PKGS"
-    
+    log "Found $WARNING_COUNT missing package(s) — attempting auto-download"
+
     PATH_ARGS=()
-    for pkg_path in "${MISSING_PKG_PATHS[@]}"; do
-      PATH_ARGS+=(--path "$pkg_path")
-    done
-    
-    if [[ -x "$DIALOG" ]]; then
-      WARNING_LIST=$(echo "$MISSING_PKGS" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
-      if [[ $WARNING_COUNT -gt 10 ]]; then
-        WARNING_LIST="${WARNING_LIST}\n\n...and $((WARNING_COUNT - 10)) more"
-      fi
-      
-      DIALOG_CMD=$(mktemp)
-      
-      "$DIALOG" \
-        --title "Pre-Push: Downloading Missing Packages" \
-        --icon "SF=arrow.down.circle.fill,palette=white,blue,blue" \
-        --iconsize 80 \
-        --message "**${WARNING_COUNT}** package(s) missing locally.\n\nDownloading from S3 before push...\n\n${WARNING_LIST}" \
-        --progress 100 \
-        --progresstext "Connecting to S3..." \
-        --width 600 \
-        --height 600 \
-        --moveable \
-        --ontop \
-        --commandfile "$DIALOG_CMD" &
-      DIALOG_PID=$!
-      sleep 0.5
-      
-      echo "progress: 10" >> "$DIALOG_CMD"
-      CURRENT_PKG=0
-      
-      POST_MERGE_HOOK="$REPO_ROOT/.githooks/post-merge"
-      if [[ -x "$POST_MERGE_HOOK" ]]; then
-        "$POST_MERGE_HOOK" "${PATH_ARGS[@]}" 2>&1 | while IFS= read -r line; do
-          echo "$line" | tee -a "$LOGFILE"
-          if [[ "$line" == *"-> syncing:"* ]]; then
-            CURRENT_PKG=$((CURRENT_PKG + 1))
-            PROGRESS=$(( 10 + (80 * CURRENT_PKG / ${#MISSING_PKG_PATHS[@]}) ))
-            PKG_NAME=$(echo "$line" | sed 's/.*-> syncing: //' | sed 's/deployment\/pkgs\///')
-            echo "progress: $PROGRESS" >> "$DIALOG_CMD"
-            echo "progresstext: Downloading: $PKG_NAME" >> "$DIALOG_CMD"
-          fi
-        done
-      fi
-      
-      echo "progress: 100" >> "$DIALOG_CMD"
-      echo "progresstext: Download complete!" >> "$DIALOG_CMD"
-      sleep 0.5
-      echo "quit:" >> "$DIALOG_CMD"
-      wait $DIALOG_PID 2>/dev/null || true
-      rm -f "$DIALOG_CMD"
-    else
-      POST_MERGE_HOOK="$REPO_ROOT/.githooks/post-merge"
-      if [[ -x "$POST_MERGE_HOOK" ]]; then
-        "$POST_MERGE_HOOK" "${PATH_ARGS[@]}" 2>&1 | tee -a "$LOGFILE"
-      fi
-    fi
-    
-    log "Re-validating pkgsinfo after download..."
+    while IFS= read -r line; do
+      p=$(echo "$line" | sed 's/.*refers to missing installer item: //')
+      PATH_ARGS+=(--path "$p")
+    done <<< "$MISSING_PKGS"
+
+    "$HOOK_DIR/post-merge" "${PATH_ARGS[@]}" 2>&1 | tee -a "$LOGFILE"
+
     rm -f "$MAKECATALOGS_OUTPUT"
     MAKECATALOGS_OUTPUT=$(mktemp)
-    makecatalogs --silent "$DEPLOYMENT" > "$MAKECATALOGS_OUTPUT" 2>&1
-    cat "$MAKECATALOGS_OUTPUT" >> "$LOGFILE"
-    
-    MISSING_PKGS_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
-    
-    if [[ -n "$MISSING_PKGS_RECHECK" ]]; then
-      STILL_MISSING=$(echo "$MISSING_PKGS_RECHECK" | wc -l | tr -d ' ')
-      log "PUSH BLOCKED: $STILL_MISSING package(s) still missing after download"
-      
-      if [[ -x "$DIALOG" ]]; then
-        STILL_LIST=$(echo "$MISSING_PKGS_RECHECK" | sed 's/WARNING: \(.*\) refers to missing installer item: \(.*\)/- \1\\n  -> missing: \2/' | head -10)
-        
-        "$DIALOG" \
-          --title "Push Blocked: Missing Packages" \
-          --icon "SF=xmark.circle.fill,palette=white,red,red" \
-          --iconsize 80 \
-          --message "After syncing from S3, **${STILL_MISSING}** package(s) are still missing.\n\nThese packages don't exist locally or in S3:\n\n${STILL_LIST}\n\nBuild/add the .pkg files first, or fix the pkgsinfo references." \
-          --button1text "OK" \
-          --width 700 \
-          --height 450 \
-          --moveable \
-          --ontop
-      fi
-      
+    makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT" | tee -a "$LOGFILE"
+    MISSING_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
+    if [[ -n "$MISSING_RECHECK" ]]; then
+      STILL=$(echo "$MISSING_RECHECK" | wc -l | tr -d ' ')
+      log "PUSH BLOCKED: $STILL package(s) still missing after download"
       rm -f "$MAKECATALOGS_OUTPUT"
       mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
       exit 1
     fi
-    
-    log "All missing packages downloaded successfully"
+    log "All missing packages downloaded"
   fi
-  
   rm -f "$MAKECATALOGS_OUTPUT"
 fi
 
-# ── change detection and selective sync ────────────────────
+# ── change detection → sync ────────────────────────────────
 changed_paths=$(detect_changes)
-
 if [[ "$changed_paths" == "none" ]]; then
-  log "No sync needed"
+  log "No binary changes — skipping sync"
   mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
   exit 0
 fi
 
-# ── AWS authentication ─────────────────────────────────────
 check_aws_auth
 
-log "On branch 'main' – syncing specific directories"
+find "$REPO_ROOT" -name ".azDownload*" -type f -delete 2>/dev/null || true
 
-# If force sync, sync everything
-if [[ "$changed_paths" == "all" ]]; then
-  log '>> syncing ALL deployment/ (force mode)'
-  
-  aws s3 sync "$REPO_ROOT/deployment" "$S3_URL/deployment/" \
-    --delete --exclude "*.DS_Store" \
-    --exclude "catalogs*" --exclude "manifests*" \
-    --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
-  
-  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
-  exit 0
-fi
+log "On branch '$current_branch' — syncing: $changed_paths"
 
-# If upload/sync mode, full sync for all pkgs
-if [[ "$changed_paths" == "upload" ]]; then
-  log '>> syncing deployment/pkgs (with orphan cleanup)'
-  
-  aws s3 sync "$REPO_ROOT/deployment/pkgs" "$S3_URL/deployment/pkgs/" \
-    --exclude "*.DS_Store" \
-    --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
-  
+SYNC_OPTS=(--delete --exclude "*.DS_Store" --only-show-errors --region "$AWS_REGION")
+[[ "$DRY_RUN" == "true" ]] && SYNC_OPTS+=(--dryrun)
+
+if [[ "$changed_paths" == "all" ]] || echo "$changed_paths" | grep -q "pkgs"; then
+  log '>> syncing deployment/pkgs'
+  aws s3 sync "$REPO_ROOT/deployment/pkgs" "$S3_URL/deployment/pkgs/" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
   cleanup_s3_orphans
-  
-  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
-  exit 0
 fi
 
-# Process each specific directory
-while IFS= read -r path; do
-  [[ -z "$path" ]] && continue
-  
-  case "$path" in
-    pkgs/*)
-      subdir="${path#pkgs/}"
-      log ">> syncing deployment/pkgs/$subdir"
-      
-      aws s3 sync "$REPO_ROOT/deployment/pkgs/$subdir" "$S3_URL/deployment/pkgs/$subdir/" \
-        --exclude "*.DS_Store" \
-        --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
-      ;;
-    
-    icons/*|icons)
-      if [[ "$path" == "icons" ]]; then
-        log ">> syncing deployment/icons/"
-        aws s3 sync "$REPO_ROOT/deployment/icons" "$S3_URL/deployment/icons/" \
-          --delete --exclude "*.DS_Store" \
-          --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
-      else
-        subdir="${path#icons/}"
-        log ">> syncing deployment/icons/$subdir"
-        aws s3 sync "$REPO_ROOT/deployment/icons/$subdir" "$S3_URL/deployment/icons/$subdir/" \
-          --delete --exclude "*.DS_Store" \
-          --region "$AWS_REGION" 2>&1 | tee -a "$LOGFILE"
-      fi
-      ;;
-  esac
-done <<< "$changed_paths"
+if [[ "$changed_paths" == "all" ]] || echo "$changed_paths" | grep -q "icons"; then
+  log '>> syncing deployment/icons'
+  aws s3 sync "$REPO_ROOT/deployment/icons" "$S3_URL/deployment/icons/" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
+fi
 
-log 'pre-push completed'
+if [[ "$changed_paths" == "upload" ]]; then
+  log '>> upload mode — full sync'
+  for sub in pkgs icons; do
+    log ">> syncing deployment/$sub"
+    aws s3 sync "$REPO_ROOT/deployment/$sub" "$S3_URL/deployment/$sub/" "${SYNC_OPTS[@]}" 2>&1 | tee -a "$LOGFILE"
+  done
+  cleanup_s3_orphans
+fi
+
+log 'pre-push complete'
 mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"

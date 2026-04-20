@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# HOOK_VERSION=2026.04.19
+#
+# ──────────────────────────────────────────────────────────────────────────────
+#  post-checkout hook  –  per-admin fresh-clone setup (AWS)
+#
+#  SCAFFOLD — fork and customise for your org's Secrets Manager + config writes.
+#  See README.md for the full pattern.
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$HOOK_DIR/../lib/common.sh"
+
+check_hook_version "post-checkout" "2026.04.19"
+should_skip_hook "post-checkout" && exit 0
+link_worktree_sync_caches
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+git -C "$REPO_ROOT" config pull.rebase true 2>/dev/null || true
+
+# ── Secrets scaffold (AWS Secrets Manager example) ─────────────────────────
+# Uncomment and customise for your environment.
+#
+# FORCE_RUN=false
+# [[ "${1:-}" == "--force" || "${1:-}" == "-f" ]] && FORCE_RUN=true
+#
+# SECRET_ID="${MUNKI_SECRET_ID:-your-secret-name}"
+# AWS_REGION="${AWS_REGION:-us-east-1}"
+#
+# if ! command -v aws &>/dev/null; then
+#   echo "AWS CLI not installed — skipping secrets bootstrap." >&2
+#   exit 0
+# fi
+#
+# # Fetch secret JSON from AWS Secrets Manager
+# SECRETS=$(aws secretsmanager get-secret-value \
+#   --secret-id "$SECRET_ID" --region "$AWS_REGION" \
+#   --query SecretString --output text 2>/dev/null || echo "{}")
+#
+# # Extract and write values — use `jq` or plain parsing
+# # MUNKI_USERNAME=$(echo "$SECRETS" | jq -r '.MunkiUsername')
+# # ...
+exit 0
