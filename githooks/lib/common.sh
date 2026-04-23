@@ -5,23 +5,34 @@
 #  Cloud-agnostic. Sourced by every Azure and AWS hook.
 #
 #  Provides:
-#    check_hook_version       – warn if this hook is older than .min-version
-#    should_skip_hook         – respect env bypass flags
-#    link_worktree_sync_caches – symlink gitignored caches in linked worktrees
-#    check_staged_binary_sizes – reject >50MB files outside pkgs/icons/
-#    acquire_hook_lock        – exclusive lock across worktrees
-#    release_hook_lock        – automatic via EXIT trap
+#    check_hook_version         – warn if this hook is older than .min-version
+#    should_skip_hook           – respect env bypass flags
+#    link_worktree_sync_caches  – symlink gitignored caches in linked worktrees
+#    check_staged_binary_sizes  – reject >50MB files outside pkgs/icons/
+#    acquire_hook_lock          – exclusive lock across worktrees
+#    release_hook_lock          – automatic via EXIT trap
+#    pkgs_dir_is_symlink        – detect linked-worktree pkgs cache
+#    path_crosses_symlink       – walks ancestors for any symlink
+#    assert_safe_delete_sync    – guard before --delete-destination=true syncs
+#    validate_munki_deployment  – sanity-check a deployment dir before destructive ops
 #
 #  Every hook should source this near the top:
 #
 #      HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 #      source "$HOOK_DIR/../lib/common.sh"
-#      check_hook_version "pre-commit" "2026.04.19"
+#      check_hook_version "pre-commit" "2026.04.22"
 #      should_skip_hook && exit 0
 #      link_worktree_sync_caches
 #      acquire_hook_lock "pre-commit" || exit 1
 #      check_staged_binary_sizes || exit 1
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Minimum pkgsinfo count that a directory must contain to be treated as an
+# authoritative Munki deployment. Anything below this is almost certainly a
+# sparse checkout, scratch workspace, or wrong path — destructive operations
+# (orphan prune, delete-sync) must refuse rather than trust it.
+# Override via MUNKI_MIN_PKGSINFO_FOR_VALID to match your fleet size.
+: "${MUNKI_MIN_PKGSINFO_FOR_VALID:=50}"
 
 # ── hook-version check ──────────────────────────────────────────────────────
 # Compares the hook's own stamped version against .githooks/.min-version.
@@ -217,7 +228,8 @@ check_staged_binary_sizes() {
 #
 # Stale-lock detection: if the PID stored in the lock isn't running, steal
 # the lock instead of blocking indefinitely — handles the case where a
-# previous hook crashed before releasing.
+# previous hook crashed before releasing. Also treats empty-content lock
+# files as stale (recovery from crash-mid-acquire).
 _hook_lock_file=""
 
 acquire_hook_lock() {
@@ -228,12 +240,15 @@ acquire_hook_lock() {
   mkdir -p "$git_common/logs"
   local lock_dir="$git_common/logs/.hook.lockdir"
 
-  # Stale-lock detection — if the PID that holds the lock isn't running,
-  # take it over. Survives hook crashes without manual cleanup.
+  # Stale-lock detection — if the PID that holds the lock isn't running, or
+  # the lock file is empty (previous hook crashed mid-acquire), take it over.
   if [[ -d "$lock_dir" ]]; then
     local stored_pid
     stored_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
-    if [[ -n "$stored_pid" ]] && ! kill -0 "$stored_pid" 2>/dev/null; then
+    if [[ -z "$stored_pid" ]]; then
+      echo "  Stealing stale hook lock (empty — previous hook crashed mid-acquire)" >&2
+      rm -rf "$lock_dir" 2>/dev/null || true
+    elif ! kill -0 "$stored_pid" 2>/dev/null; then
       echo "  Stealing stale hook lock (pid $stored_pid no longer running)" >&2
       rm -rf "$lock_dir" 2>/dev/null || true
     fi
@@ -259,4 +274,67 @@ release_hook_lock() {
   [[ -z "$_hook_lock_file" ]] && return 0
   rm -rf "$_hook_lock_file" 2>/dev/null || true
   _hook_lock_file=""
+}
+
+# ── symlink-crossing guards ────────────────────────────────────────────────
+# When a hook runs inside a linked worktree, its `deployment/pkgs` may be a
+# symlink pointing at the primary worktree's real cache. Every destructive
+# operation (orphan prune, `--delete-destination=true` sync) must refuse to
+# traverse that link — otherwise a sparse worktree view deletes the primary's
+# real files.
+
+# Return 0 if the given path is itself a symlink.
+pkgs_dir_is_symlink() {
+  [[ -L "$1" ]]
+}
+
+# Walk ancestors of $1 checking for any symlink. On 0 return, echoes the
+# symlink path for use in the error message.
+path_crosses_symlink() {
+  local p="$1"
+  while [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; do
+    if [[ -L "$p" ]]; then
+      echo "$p"
+      return 0
+    fi
+    local parent
+    parent="$(dirname "$p")"
+    [[ "$parent" == "$p" ]] && break
+    p="$parent"
+  done
+  return 1
+}
+
+# Refuse destructive sync if target would traverse a symlink. Use as a guard
+# at the top of every call that passes --delete-destination=true.
+assert_safe_delete_sync() {
+  local target="$1" description="${2:-delete sync}"
+  local cross
+  if cross=$(path_crosses_symlink "$target"); then
+    echo "REFUSING $description: '$target' crosses symlink at '$cross'" >&2
+    echo "  This would delete through the link into the primary worktree's cache." >&2
+    echo "  Run destructive syncs from the primary checkout instead." >&2
+    return 1
+  fi
+  return 0
+}
+
+# ── deployment-path validator ──────────────────────────────────────────────
+# A deployment dir is only trusted as authoritative if it has pkgsinfo/,
+# catalogs/, and at least MUNKI_MIN_PKGSINFO_FOR_VALID pkgsinfo files. Without
+# this, downstream destructive operations (orphan prune, delete-sync) can wipe
+# hundreds of production blobs when fed a stale or sparse deployment path.
+validate_munki_deployment() {
+  # Don't name the local "path" — zsh aliases it to $PATH.
+  local dep="$1"
+  [[ -n "$dep" && -d "$dep" ]] || return 1
+  [[ -d "$dep/pkgsinfo" ]] || return 1
+  [[ -d "$dep/catalogs" ]] || return 1
+
+  local count=0 _f
+  while IFS= read -r _f; do
+    count=$((count + 1))
+    (( count >= MUNKI_MIN_PKGSINFO_FOR_VALID )) && return 0
+  done < <(find "$dep/pkgsinfo" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.plist' \) 2>/dev/null)
+  return 1
 }

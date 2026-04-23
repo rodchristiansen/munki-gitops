@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.19
+# HOOK_VERSION=2026.04.22
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  post-checkout hook  –  per-admin fresh-clone setup (Azure)
@@ -27,7 +27,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "post-checkout" "2026.04.19"
+check_hook_version "post-checkout" "2026.04.22"
 should_skip_hook "post-checkout" && exit 0
 link_worktree_sync_caches
 

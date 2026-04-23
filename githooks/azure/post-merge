@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.19
+# HOOK_VERSION=2026.04.22
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  post-merge hook  –  targeted package downloads after git pull/merge (Azure)
@@ -12,7 +12,7 @@
 #      2. HTTP caching server fast-path (if MUNKI_CACHING_SERVERS set + not VPN)
 #      3. Batch every cache miss into one `azcopy copy --list-of-files` call
 #      4. Sync catalogs/icons folders if changed
-#      5. Orphan cleanup (main/master only, capped)
+#      5. Orphan cleanup (main/master only, capped, symlink-safe)
 #
 #  • Flags: --sync, --force (double-confirm), --dry-run, --path <relative>
 #
@@ -27,7 +27,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "post-merge" "2026.04.19"
+check_hook_version "post-merge" "2026.04.22"
 should_skip_hook "post-merge" && exit 0
 link_worktree_sync_caches
 
@@ -149,7 +149,17 @@ try_caching_download() {
   return 1
 }
 
-# ── Azure authentication check ─────────────────────────────
+# ── Azure authentication ───────────────────────────────────
+# When MUNKI_AZURE_TENANT_ID is set, attempts an interactive `az login` on
+# missing/expired credentials. Leave unset to block on manual auth.
+azure_login() {
+  if [[ -n "$TENANT_ID" ]]; then
+    az login --tenant "$TENANT_ID"
+  else
+    az login
+  fi
+}
+
 check_azure_auth() {
   local timeout_cmd=""
   if command -v gtimeout &>/dev/null; then
@@ -157,14 +167,22 @@ check_azure_auth() {
   else
     timeout_cmd="perl -e 'alarm shift @ARGV; exec @ARGV' 10"
   fi
+
   if ! eval "$timeout_cmd az account show &>/dev/null"; then
-    log "Azure CLI not authenticated or timed out."
-    if [[ -n "$TENANT_ID" ]]; then
-      log "  Run: az login --tenant $TENANT_ID"
-    else
-      log "  Run: az login"
+    log "Azure CLI not authenticated — attempting login..."
+    if ! azure_login; then
+      log "ERROR: az login failed. Please authenticate manually and retry."
+      exit 1
     fi
-    exit 1
+  fi
+
+  # Verify storage token too (catches expired refresh tokens that pass az account show).
+  if ! eval "$timeout_cmd az account get-access-token --resource https://storage.azure.com &>/dev/null"; then
+    log "Azure storage token expired — re-running az login..."
+    if ! azure_login; then
+      log "ERROR: az login failed. Please authenticate manually and retry."
+      exit 1
+    fi
   fi
 }
 
@@ -204,13 +222,36 @@ build_canonical_pkg_list() {
   } | sort -u
 }
 
-# ── orphan cleanup (main/master, capped) ───────────────────
+# ── orphan cleanup (main/master, capped, symlink-safe) ─────
 ORPHAN_DELETION_CAP="${MUNKI_ORPHAN_DELETION_CAP:-10}"
 cleanup_orphan_packages() {
   local pkgs_dir="$REPO_ROOT/deployment/pkgs"
   [[ -d "$pkgs_dir" ]] || return 0
+
+  # SAFETY: if pkgs_dir is a symlink (linked worktree cache), rm through the
+  # link would delete the primary's real files. Primary handles its own cleanup.
+  if pkgs_dir_is_symlink "$pkgs_dir"; then
+    log "SKIP orphan cleanup: '$pkgs_dir' is a symlink (linked worktree cache)."
+    return 0
+  fi
+
   local canonical_file; canonical_file=$(mktemp)
   build_canonical_pkg_list > "$canonical_file"
+  local canonical_count; canonical_count=$(wc -l < "$canonical_file" | tr -d ' ')
+  log "Found $canonical_count packages referenced in pkgsinfo"
+
+  # SAFETY FLOOR: a tiny canonical set means parse error / sparse checkout /
+  # wrong path. Don't let that silently classify real pkgs as orphans.
+  if (( canonical_count < MUNKI_MIN_PKGSINFO_FOR_VALID )); then
+    log "SKIP orphan cleanup: canonical pkgsinfo count $canonical_count < floor $MUNKI_MIN_PKGSINFO_FOR_VALID."
+    rm -f "$canonical_file"
+    return 0
+  fi
+  if ! validate_munki_deployment "$REPO_ROOT/deployment"; then
+    log "SKIP orphan cleanup: '$REPO_ROOT/deployment' does not validate as a Munki deployment."
+    rm -f "$canonical_file"
+    return 0
+  fi
 
   local orphans=()
   while IFS= read -r -d '' pkg_file; do
@@ -242,6 +283,8 @@ cleanup_orphan_packages() {
 # ── batched Azure download (cache-first, parallel on Azure) ───
 # Takes a newline-separated list of relative paths (e.g. "apps/foo.pkg")
 # and downloads each via caching server (serial HTTP) or batched azcopy.
+#
+# On AADSTS / token-expired mid-batch, re-runs `az login` once and retries.
 download_pkgs_cache_first_batched() {
   local paths_file="$1"
   [[ -s "$paths_file" ]] || return 0
@@ -285,13 +328,45 @@ download_pkgs_cache_first_batched() {
     check_azure_auth
     export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
     log ">> batch-downloading $batch_count cache miss(es) from Azure (parallel)"
-    local exit_code=0
-    "$AZCOPY" copy "$STORAGE_URL/deployment/pkgs/" "$REPO_ROOT/deployment/pkgs/" \
+
+    # --as-subdir=false: without this azcopy preserves the source URL's last
+    # path segment ("pkgs") as a subdir under the destination, producing
+    # deployment/pkgs/pkgs/apps/... (double-nesting) — azcopy's default
+    # directory-copy behavior. Has bitten targeted path downloads before.
+    local azcopy_output exit_code=0
+    azcopy_output=$("$AZCOPY" copy \
+      "$STORAGE_URL/deployment/pkgs/" \
+      "$REPO_ROOT/deployment/pkgs/" \
       --list-of-files="$azure_batch" \
+      --as-subdir=false \
       --overwrite=ifSourceNewer \
-      --log-level=ERROR --output-level=essential 2>&1 | tee -a "$LOGFILE" || exit_code=$?
+      --log-level=ERROR --output-level=essential 2>&1) || exit_code=$?
+    echo "$azcopy_output" >> "$LOGFILE"
+
     if (( exit_code != 0 )); then
-      log "  WARNING: batch azcopy exited $exit_code — some files may not exist in Azure"
+      if echo "$azcopy_output" | grep -qE "(AADSTS|Failed to perform Auto-login|refresh token has expired)"; then
+        log "Azure authentication failed mid-download — re-running az login..."
+        if ! azure_login; then
+          log "ERROR: az login failed. Please authenticate manually and retry."
+          rm -f "$azure_batch"
+          mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+          exit 1
+        fi
+        exit_code=0
+        azcopy_output=$("$AZCOPY" copy \
+          "$STORAGE_URL/deployment/pkgs/" \
+          "$REPO_ROOT/deployment/pkgs/" \
+          --list-of-files="$azure_batch" \
+          --as-subdir=false \
+          --overwrite=ifSourceNewer \
+          --log-level=ERROR --output-level=essential 2>&1) || exit_code=$?
+        echo "$azcopy_output" >> "$LOGFILE"
+        if (( exit_code != 0 )); then
+          log "  WARNING: batch azcopy exited $exit_code after re-auth"
+        fi
+      else
+        log "  WARNING: batch azcopy exited $exit_code — some files may not exist in Azure"
+      fi
     fi
   fi
   rm -f "$azure_batch"
@@ -371,7 +446,7 @@ fi
 if [[ "$changed_paths" == "force" ]]; then
   echo ""
   echo "════════════════════════════════════════════════════════════════════════════"
-  echo "  ⚠️  FORCE MODE — NUCLEAR OPTION"
+  echo "  FORCE MODE — NUCLEAR OPTION"
   echo ""
   echo "  Will download the entire deployment/ from Azure, bypassing hash checks."
   echo "  Use --sync for incremental hash-based sync instead."
@@ -382,6 +457,14 @@ if [[ "$changed_paths" == "force" ]]; then
   [[ "$FIRST" != "y" && "$FIRST" != "Y" ]] && { log "Aborted."; exit 0; }
   read -p "Type 'FORCE' to proceed: " CONFIRM2
   [[ "$CONFIRM2" != "FORCE" ]] && { log "Aborted (second confirmation not matched)."; exit 0; }
+
+  # SAFETY: refuse force-mirror sync when targets cross a symlink (linked
+  # worktree). --delete-destination=true would rm through the link.
+  if ! assert_safe_delete_sync "$REPO_ROOT/deployment/pkgs" "force-sync deployment/pkgs"; then
+    log "Aborting --force mode — run from the primary worktree instead."
+    mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+    exit 1
+  fi
 
   check_azure_auth
   export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
@@ -397,6 +480,13 @@ fi
 
 # ── sync mode ──────────────────────────────────────────────
 if [[ "$changed_paths" == "sync" ]]; then
+  # SAFETY: refuse full --sync when targets cross a symlink (linked worktree).
+  if ! assert_safe_delete_sync "$REPO_ROOT/deployment/pkgs" "--sync deployment/pkgs"; then
+    log "Aborting --sync mode — run from the primary worktree instead."
+    mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+    exit 1
+  fi
+
   check_azure_auth
   export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
   log ">> sync mode — full folder sync with MD5 comparison"
@@ -446,7 +536,7 @@ if echo "$changed_paths" | grep -q "pkgsinfo"; then
   fi
 fi
 
-# ── orphan cleanup (main/master only) ──────────────────────
+# ── orphan cleanup (main/master only, symlink-safe) ────────
 log "Checking for orphan packages..."
 cleanup_orphan_packages
 

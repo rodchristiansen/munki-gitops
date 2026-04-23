@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.19
+# HOOK_VERSION=2026.04.22
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-push hook  –  safe Azure Blob upload for Munki repo
@@ -10,7 +10,9 @@
 #  • Every `azcopy sync` writes MD5 to blob metadata (--put-md5) so future
 #    --compare-hash=MD5 runs have something to compare against — without it,
 #    hash compares are meaningless and files re-transfer every time.
-#  • Azure orphan cleanup after successful sync.
+#  • Azure orphan cleanup after successful sync (capped, deployment-validated).
+#  • Symlink-crossing guard refuses delete-syncs that would traverse into the
+#    primary worktree's cache.
 #
 #  • Env bypass: GIT_NO_VERIFY, SKIP_MUNKI_HOOKS, SKIP_PRE_PUSH, DISABLE_CUSTOM_HOOKS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -22,7 +24,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "pre-push" "2026.04.19"
+check_hook_version "pre-push" "2026.04.22"
 should_skip_hook "pre-push" && exit 0
 link_worktree_sync_caches
 acquire_hook_lock "pre-push" || exit 1
@@ -36,6 +38,14 @@ fi
 STORAGE_ACCOUNT="${MUNKI_STORAGE_ACCOUNT:-yourstorageaccount}"
 CONTAINER="${MUNKI_CONTAINER:-munki}"
 STORAGE_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}"
+TENANT_ID="${MUNKI_AZURE_TENANT_ID:-}"
+
+# Safety cap for Azure orphan deletions. The canonical-set floor inside
+# cleanup_azure_orphans catches "wrong deployment path" cases; this cap
+# catches the rarer case where canonical is valid but Azure drifted far
+# (e.g. another admin repoclean'd hundreds of old pkgs). Surface a large
+# deletion for review rather than silently nuking.
+AZURE_ORPHAN_DELETION_CAP="${MUNKI_AZURE_ORPHAN_DELETION_CAP:-50}"
 
 # ── azcopy detection ───────────────────────────────────────
 if [[ -x "/opt/homebrew/bin/azcopy" ]]; then
@@ -86,7 +96,15 @@ next_index() {
   echo $((max+1))
 }
 
-# ── Azure auth ─────────────────────────────────────────────
+# ── Azure auth (with optional auto-login) ─────────────────
+azure_login() {
+  if [[ -n "$TENANT_ID" ]]; then
+    az login --tenant "$TENANT_ID"
+  else
+    az login
+  fi
+}
+
 check_azure_auth() {
   local timeout_cmd=""
   if command -v gtimeout &>/dev/null; then
@@ -94,9 +112,21 @@ check_azure_auth() {
   else
     timeout_cmd="perl -e 'alarm shift @ARGV; exec @ARGV' 10"
   fi
+
   if ! eval "$timeout_cmd az account show &>/dev/null"; then
-    log "Azure CLI not authenticated — run 'az login' first."
-    exit 1
+    log "Azure CLI not authenticated — attempting login..."
+    if ! azure_login; then
+      log "ERROR: az login failed. Please authenticate manually and retry."
+      exit 1
+    fi
+  fi
+
+  if ! eval "$timeout_cmd az account get-access-token --resource https://storage.azure.com &>/dev/null"; then
+    log "Azure storage token expired — re-running az login..."
+    if ! azure_login; then
+      log "ERROR: az login failed. Please authenticate manually and retry."
+      exit 1
+    fi
   fi
 }
 
@@ -124,13 +154,30 @@ build_canonical_pkg_list_committed() {
   } | sort -u
 }
 
-# ── Azure orphan cleanup ───────────────────────────────────
+# ── Azure orphan cleanup (floor + hard cap + deployment check) ─
 cleanup_azure_orphans() {
   log "Building canonical package list from committed pkgsinfo..."
   local canonical_file; canonical_file=$(mktemp)
   build_canonical_pkg_list_committed > "$canonical_file"
   local canonical_count; canonical_count=$(wc -l < "$canonical_file" | tr -d ' ')
   log "  $canonical_count packages referenced in committed pkgsinfo"
+
+  # SAFETY FLOOR: a tiny canonical set almost always means we resolved the
+  # wrong deployment dir or are in a sparse scratch workspace. Refuse to
+  # prune rather than nuking the blob catalog.
+  if (( canonical_count < MUNKI_MIN_PKGSINFO_FOR_VALID )); then
+    log "ABORT orphan cleanup: canonical set has only $canonical_count pkgsinfo entries (min $MUNKI_MIN_PKGSINFO_FOR_VALID)."
+    log "  Check the deployment path or raise MUNKI_MIN_PKGSINFO_FOR_VALID if your fleet is small."
+    rm -f "$canonical_file"
+    return 0
+  fi
+
+  # Also cross-reference the deployment structure itself.
+  if ! validate_munki_deployment "$REPO_ROOT/deployment"; then
+    log "ABORT orphan cleanup: '$REPO_ROOT/deployment' does not validate as a Munki deployment."
+    rm -f "$canonical_file"
+    return 0
+  fi
 
   local azure_list; azure_list=$(mktemp)
   "$AZCOPY" list "$STORAGE_URL/deployment/pkgs/" 2>/dev/null | \
@@ -144,6 +191,18 @@ cleanup_azure_orphans() {
   local orphans; orphans=$(mktemp)
   comm -23 "$azure_list" "$canonical_file" > "$orphans"
   local orphan_count; orphan_count=$(wc -l < "$orphans" | tr -d ' ')
+
+  # HARD CAP: never silently mass-delete from Azure. Surface large deletions
+  # for manual review.
+  if (( orphan_count > AZURE_ORPHAN_DELETION_CAP )); then
+    log "ABORT orphan cleanup: $orphan_count Azure orphans exceed cap ($AZURE_ORPHAN_DELETION_CAP)."
+    log "  First 20 orphans that would have been deleted:"
+    head -20 "$orphans" | while IFS= read -r o; do log "    - $o"; done
+    (( orphan_count > 20 )) && log "    ... and $((orphan_count - 20)) more"
+    log "  Review manually or raise MUNKI_AZURE_ORPHAN_DELETION_CAP if intentional."
+    rm -f "$canonical_file" "$azure_list" "$orphans"
+    return 0
+  fi
 
   if (( orphan_count > 0 )); then
     log "Found $orphan_count orphan package(s) in Azure:"
@@ -283,6 +342,7 @@ else
     if [[ -n "$MISSING_RECHECK" ]]; then
       STILL=$(echo "$MISSING_RECHECK" | wc -l | tr -d ' ')
       log "PUSH BLOCKED: $STILL package(s) still missing after download"
+      log "$(echo "$MISSING_RECHECK" | sed 's/.*refers to missing installer item: /  - /')"
       rm -f "$MAKECATALOGS_OUTPUT"
       mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
       exit 1
@@ -308,7 +368,16 @@ log "On branch '$current_branch' — syncing: $changed_paths"
 # Cleanup temp files
 find "$REPO_ROOT" -name ".azDownload*" -type f -delete 2>/dev/null || true
 
-# Common flags — --put-md5 (M4) is REQUIRED. Without it, future syncs can't
+# SAFETY: refuse any upload-sync path that crosses a symlink (linked worktree).
+# --delete-destination=true would traverse the link to enumerate local files
+# and delete Azure blobs not present in the sparse worktree view.
+if ! assert_safe_delete_sync "$REPO_ROOT/deployment/pkgs" "pre-push upload sync"; then
+  log "Aborting pre-push — push from the primary worktree instead."
+  mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
+  exit 1
+fi
+
+# Common flags — --put-md5 is REQUIRED. Without it, future syncs can't
 # compare hashes and re-transfer every file every time.
 AZCOPY_SYNC_FLAGS=(
   --delete-destination=true

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.19
+# HOOK_VERSION=2026.04.22
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-commit hook  –  validates Munki pkgsinfo before committing (Azure)
@@ -12,8 +12,9 @@
 #    5. Worktree cache link (no-op in primary)
 #    6. Structural pkgsinfo linter (typos, invalid enums, install loops)
 #    7. makecatalogs validation (parse errors, missing keys, invalid locations)
-#    8. Missing-pkg auto-download from Azure (batched)
-#    9. Orphan pkg cleanup (main only, capped at 10)
+#    8. Missing-pkg auto-download from Azure (batched, cache-first)
+#    9. Orphan pkg cleanup (main only, capped, symlink-safe, deployment-validated)
+#   10. Stale-upstream detection (pkgsinfo deleted on origin/main)
 #
 #  Uses swiftDialog for user-friendly error notifications (optional).
 # ──────────────────────────────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "pre-commit" "2026.04.19"
+check_hook_version "pre-commit" "2026.04.22"
 should_skip_hook "pre-commit" && exit 0
 link_worktree_sync_caches
 acquire_hook_lock "pre-commit" || exit 1
@@ -50,6 +51,9 @@ fi
 USE_DIALOG=false
 [[ -x "$DIALOG" ]] && USE_DIALOG=true
 
+# Standard dialog font — mono at 12pt makes pkg paths readable.
+DIALOG_FONT="name=Menlo,size=12"
+
 # ── M1: structural pkgsinfo linter ─────────────────────────
 # Runs before makecatalogs so typos and schema errors get friendly messages
 # instead of makecatalogs' opaque stack traces.
@@ -68,7 +72,7 @@ if [[ -x "$LINT_SCRIPT" ]] && command -v python3 >/dev/null 2>&1; then
         --iconsize 80 \
         --message "Static validation caught structural issues:\n\n\`\`\`\n${LINT_REPORT}\n\`\`\`" \
         --button1text "OK" \
-        --messagefont "size=12" \
+        --messagefont "$DIALOG_FONT" \
         --width 780 --height 560 --moveable || true
     fi
     rm -f "$LINT_OUTPUT"
@@ -100,7 +104,8 @@ if [[ -n "$PARSE_ERRORS" ]]; then
       --iconsize 80 \
       --message "**makecatalogs** found **${ERROR_COUNT}** pkgsinfo file(s) that cannot be parsed.\n\n${ERROR_LIST}" \
       --button1text "OK" \
-      --messagefont "size=14" --width 700 --height 400 --moveable || true
+      --messagefont "$DIALOG_FONT" \
+      --width 700 --height 400 --moveable || true
   fi
 
   rm -f "$MAKECATALOGS_OUTPUT"
@@ -110,14 +115,22 @@ if [[ -n "$PARSE_ERRORS" ]]; then
   exit 1
 fi
 
-# ── M2 + M3: orphan pkg cleanup (main/master only, capped) ─
+# ── M2 + M3: orphan pkg cleanup (main/master only, capped, symlink-safe) ─
 # Run BEFORE missing-pkg handling so we don't try to download pkgs we're
 # about to delete anyway.
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
   PKGS_DIR="$DEPLOYMENT/pkgs"
   PKGSINFO_DIR="$DEPLOYMENT/pkgsinfo"
-  if [[ -d "$PKGS_DIR" && -d "$PKGSINFO_DIR" ]]; then
+
+  # SAFETY: skip if pkgs_dir is a symlink (linked worktree). The primary
+  # worktree handles orphan cleanup on its own commits; rm through a link
+  # would delete primary's real files.
+  if pkgs_dir_is_symlink "$PKGS_DIR"; then
+    echo "[pre-commit] SKIP orphan cleanup: '$PKGS_DIR' is a symlink (linked worktree cache)."
+  elif ! validate_munki_deployment "$DEPLOYMENT"; then
+    echo "[pre-commit] SKIP orphan cleanup: '$DEPLOYMENT' does not validate as a Munki deployment."
+  elif [[ -d "$PKGS_DIR" && -d "$PKGSINFO_DIR" ]]; then
     CANONICAL_FILE=$(mktemp)
     # YAML pkgsinfo
     grep -rhE '^[[:space:]]*installer_item_location:[[:space:]]*' "$PKGSINFO_DIR" \
@@ -129,43 +142,55 @@ if [[ "$CURRENT_BRANCH" == "main" || "$CURRENT_BRANCH" == "master" ]]; then
       grep '<string>' | sed -E 's/.*<string>(.*)<\/string>.*/\1/' >> "$CANONICAL_FILE" || true
     sort -u -o "$CANONICAL_FILE" "$CANONICAL_FILE"
 
-    ORPHANS=()
-    while IFS= read -r -d '' pkg_file; do
-      rel_path="${pkg_file#$PKGS_DIR/}"
-      if ! grep -qxF "$rel_path" "$CANONICAL_FILE" 2>/dev/null; then
-        ORPHANS+=("$rel_path")
+    CANONICAL_COUNT=$(wc -l < "$CANONICAL_FILE" | tr -d ' ')
+
+    # SAFETY FLOOR: if canonical parse produced too few entries, every local
+    # pkg will look orphan. The cap below only catches wholesale deletions —
+    # any slippage under the cap (parse error + <cap pkgs touched) would
+    # delete silently. Block the cleanup entirely instead.
+    if (( CANONICAL_COUNT < MUNKI_MIN_PKGSINFO_FOR_VALID )); then
+      echo "[pre-commit] SKIP orphan cleanup: canonical pkgsinfo parse returned only $CANONICAL_COUNT entries (min $MUNKI_MIN_PKGSINFO_FOR_VALID)."
+      echo "[pre-commit] Likely a YAML parse error, sparse checkout, or wrong deployment path."
+      rm -f "$CANONICAL_FILE"
+    else
+      ORPHANS=()
+      while IFS= read -r -d '' pkg_file; do
+        rel_path="${pkg_file#$PKGS_DIR/}"
+        if ! grep -qxF "$rel_path" "$CANONICAL_FILE" 2>/dev/null; then
+          ORPHANS+=("$rel_path")
+        fi
+      done < <(find "$PKGS_DIR" -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.zip" -o -name "*.mobileconfig" \) -print0 2>/dev/null)
+
+      ORPHAN_COUNT=${#ORPHANS[@]}
+      rm -f "$CANONICAL_FILE"
+
+      if (( ORPHAN_COUNT > ORPHAN_DELETION_CAP )); then
+        echo ""
+        echo "COMMIT BLOCKED: ${ORPHAN_COUNT} orphan package(s) found (cap is ${ORPHAN_DELETION_CAP})."
+        echo "This is unusual — possible causes:"
+        echo "  • Partial pkgsinfo set (branch switch in progress)"
+        echo "  • Stale local pkgs from a prior branch"
+        echo "  • YAML parse errors masking installer_item_location"
+        echo ""
+        echo "Sample orphans (first 15):"
+        for o in "${ORPHANS[@]:0:15}"; do echo "  • $o"; done
+        (( ORPHAN_COUNT > 15 )) && echo "  ... and $((ORPHAN_COUNT - 15)) more"
+        echo ""
+        echo "If genuinely orphaned, delete manually and retry:"
+        echo "  (cd $PKGS_DIR && rm <relative-path>)"
+        exit 1
       fi
-    done < <(find "$PKGS_DIR" -type f \( -name "*.pkg" -o -name "*.dmg" -o -name "*.zip" -o -name "*.mobileconfig" \) -print0 2>/dev/null)
 
-    ORPHAN_COUNT=${#ORPHANS[@]}
-    rm -f "$CANONICAL_FILE"
-
-    if (( ORPHAN_COUNT > ORPHAN_DELETION_CAP )); then
-      echo ""
-      echo "COMMIT BLOCKED: ${ORPHAN_COUNT} orphan package(s) found (cap is ${ORPHAN_DELETION_CAP})."
-      echo "This is unusual — possible causes:"
-      echo "  • Partial pkgsinfo set (branch switch in progress)"
-      echo "  • Stale local pkgs from a prior branch"
-      echo "  • YAML parse errors masking installer_item_location"
-      echo ""
-      echo "Sample orphans (first 15):"
-      for o in "${ORPHANS[@]:0:15}"; do echo "  • $o"; done
-      (( ORPHAN_COUNT > 15 )) && echo "  ... and $((ORPHAN_COUNT - 15)) more"
-      echo ""
-      echo "If genuinely orphaned, delete manually and retry:"
-      echo "  (cd $PKGS_DIR && rm <relative-path>)"
-      exit 1
-    fi
-
-    if (( ORPHAN_COUNT > 0 )); then
-      echo ""
-      echo "Found ${ORPHAN_COUNT} orphan package(s) — cleaning up:"
-      for o in "${ORPHANS[@]}"; do
-        echo "  • $o"
-        rm -f "$PKGS_DIR/$o"
-      done
-      find "$PKGS_DIR" -type d -empty -delete 2>/dev/null || true
-      echo ""
+      if (( ORPHAN_COUNT > 0 )); then
+        echo ""
+        echo "Found ${ORPHAN_COUNT} orphan package(s) — cleaning up:"
+        for o in "${ORPHANS[@]}"; do
+          echo "  • $o"
+          rm -f "$PKGS_DIR/$o"
+        done
+        find "$PKGS_DIR" -type d -empty -delete 2>/dev/null || true
+        echo ""
+      fi
     fi
   fi
 else
@@ -184,6 +209,56 @@ if [[ -n "$MISSING_PKGS" ]]; then
     MISSING_PKG_PATHS+=("$pkg_path")
   done <<< "$MISSING_PKGS"
 
+  # ── detect pkgsinfo deleted upstream (e.g. by repoclean on origin/main) ─
+  # If our local pkgsinfo points at pkgs that are gone from origin/main,
+  # downloading them is futile — the pkg doesn't exist in the remote store
+  # anymore. Ask the admin to pull first.
+  STALE_UPSTREAM=()
+  FRESH_MISSING=()
+  REMOTE_NAME="${MUNKI_REMOTE_NAME:-origin}"
+  REMOTE_BRANCH="${MUNKI_REMOTE_BRANCH:-main}"
+
+  if git fetch --quiet "$REMOTE_NAME" "$REMOTE_BRANCH" 2>/dev/null; then
+    MERGE_BASE=$(git merge-base HEAD "$REMOTE_NAME/$REMOTE_BRANCH" 2>/dev/null || true)
+    while IFS= read -r warn_line; do
+      pkgsinfo_rel=$(echo "$warn_line" | sed -E 's/^WARNING:[[:space:]]+(.+)[[:space:]]+refers to missing installer item:.*/\1/')
+      full_path="deployment/${pkgsinfo_rel}"
+      if [[ -n "$MERGE_BASE" ]] \
+         && git cat-file -e "${MERGE_BASE}:${full_path}" 2>/dev/null \
+         && ! git cat-file -e "${REMOTE_NAME}/${REMOTE_BRANCH}:${full_path}" 2>/dev/null; then
+        STALE_UPSTREAM+=("$pkgsinfo_rel")
+      else
+        FRESH_MISSING+=("$pkgsinfo_rel")
+      fi
+    done <<< "$MISSING_PKGS"
+
+    if (( ${#STALE_UPSTREAM[@]} > 0 )); then
+      STALE_COUNT=${#STALE_UPSTREAM[@]}
+      echo ""
+      echo "COMMIT BLOCKED: $STALE_COUNT pkgsinfo file(s) reference packages removed from ${REMOTE_NAME}/${REMOTE_BRANCH}."
+      echo "Pull first: git pull --rebase $REMOTE_NAME $REMOTE_BRANCH"
+      echo ""
+      echo "Stale pkgsinfo (will be removed on pull):"
+      for s in "${STALE_UPSTREAM[@]:0:10}"; do echo "  - $s"; done
+      (( STALE_COUNT > 10 )) && echo "  ... and $((STALE_COUNT - 10)) more"
+
+      if [[ "$USE_DIALOG" == "true" ]]; then
+        STALE_LIST=$(printf -- '- %s\n' "${STALE_UPSTREAM[@]:0:10}")
+        (( STALE_COUNT > 10 )) && STALE_LIST+=$'\n... and '"$((STALE_COUNT - 10))"' more'
+        "$DIALOG" \
+          --title "Commit Blocked: Local Branch Behind" \
+          --icon "SF=arrow.clockwise.circle.fill,palette=white,blue,blue" \
+          --iconsize 80 \
+          --message "**${STALE_COUNT}** pkgsinfo file(s) reference packages removed from \`${REMOTE_NAME}/${REMOTE_BRANCH}\`.\n\nPull first:\n\n\`\`\`\ngit pull --rebase ${REMOTE_NAME} ${REMOTE_BRANCH}\n\`\`\`\n\n**Stale pkgsinfo:**\n\n${STALE_LIST}" \
+          --button1text "OK" \
+          --messagefont "$DIALOG_FONT" \
+          --width 700 --height 500 --moveable || true
+      fi
+      rm -f "$MAKECATALOGS_OUTPUT"
+      exit 1
+    fi
+  fi
+
   # ── safety gate: cap auto-downloads relative to staged pkgsinfo ─────
   STAGED_PKGSINFO_COUNT=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null \
     | grep -cE '^deployment/pkgsinfo/.*\.(yaml|yml)$' || true)
@@ -200,6 +275,9 @@ if [[ -n "$MISSING_PKGS" ]]; then
 
   echo ""
   echo "Found ${WARNING_COUNT} missing package(s). Downloading from Azure..."
+  MISSING_LIST=$(echo "$MISSING_PKGS" | sed 's/.*refers to missing installer item: /- /' | head -10)
+  echo "$MISSING_LIST"
+  (( WARNING_COUNT > 10 )) && echo "  ... and $((WARNING_COUNT - 10)) more"
 
   PATH_ARGS=()
   for pkg_path in "${MISSING_PKG_PATHS[@]}"; do
@@ -225,7 +303,7 @@ if [[ -n "$MISSING_PKGS" ]]; then
   MISSING_PKGS_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
   if [[ -n "$MISSING_PKGS_RECHECK" ]]; then
     STILL_MISSING=$(echo "$MISSING_PKGS_RECHECK" | wc -l | tr -d ' ')
-    STILL_LIST=$(echo "$MISSING_PKGS_RECHECK" | sed 's/WARNING: /• /' | head -10)
+    STILL_LIST=$(echo "$MISSING_PKGS_RECHECK" | sed 's/.*refers to missing installer item: /- /' | head -10)
 
     if [[ "$USE_DIALOG" == "true" ]]; then
       "$DIALOG" \
@@ -234,11 +312,13 @@ if [[ -n "$MISSING_PKGS" ]]; then
         --iconsize 80 \
         --message "After syncing from Azure, **${STILL_MISSING}** package(s) are still missing.\n\n${STILL_LIST}\n\nEither add the .pkg files manually or fix the pkgsinfo references." \
         --button1text "OK" \
-        --messagefont "size=14" --width 700 --height 450 --moveable || true
+        --messagefont "$DIALOG_FONT" \
+        --width 700 --height 450 --moveable || true
     fi
 
     rm -f "$MAKECATALOGS_OUTPUT"
     echo "COMMIT BLOCKED: Some packages are still missing after download."
+    echo "$STILL_LIST"
     exit 1
   fi
 
@@ -258,7 +338,8 @@ if [[ $MAKECATALOGS_EXIT -ne 0 ]]; then
       --iconsize 80 \
       --message "**makecatalogs** exited with error code ${MAKECATALOGS_EXIT}.\n\n\`\`\`\n${ERROR_TAIL}\n\`\`\`" \
       --button1text "OK" \
-      --messagefont "size=14" --width 700 --height 400 --moveable || true
+      --messagefont "$DIALOG_FONT" \
+      --width 700 --height 400 --moveable || true
   fi
   rm -f "$MAKECATALOGS_OUTPUT"
   echo "COMMIT BLOCKED: makecatalogs failed with exit code $MAKECATALOGS_EXIT"
