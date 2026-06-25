@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.19
+# HOOK_VERSION=2026.06.25
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-commit hook  –  validates Munki pkgsinfo before committing (AWS S3)
@@ -15,7 +15,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "pre-commit" "2026.04.19"
+check_hook_version "pre-commit" "2026.06.25"
 should_skip_hook "pre-commit" && exit 0
 link_worktree_sync_caches
 acquire_hook_lock "pre-commit" || exit 1
@@ -37,6 +37,38 @@ fi
 
 USE_DIALOG=false
 [[ -x "$DIALOG" ]] && USE_DIALOG=true
+
+# ── Auto-quote tz-aware ISO datetimes in staged pkgsinfo ───
+# Unquoted `creation_date: 2026-04-22T17:51:22Z` parses as a tz-aware datetime
+# in PyYAML and crashes anything comparing it to a naive datetime. Quoting keeps
+# it a string. Silent fix: rewrite staged YAMLs in place and re-stage.
+STAGED_PKGSINFO_YAML=$(git diff --cached --name-only --diff-filter=ACM -- 'deployment/pkgsinfo/*.yaml' 'deployment/pkgsinfo/*.yml' 2>/dev/null || true)
+if [[ -n "$STAGED_PKGSINFO_YAML" ]] && command -v python3 >/dev/null 2>&1; then
+  FIXED_PATHS=$(printf '%s\n' "$STAGED_PKGSINFO_YAML" | python3 -c '
+import re, sys
+RE = re.compile(
+    r"^(\s*(?:-\s+)?[A-Za-z_][\w-]*\s*:\s*)"
+    r"(\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))"
+    r"(\s*(?:\#.*)?)$",
+    re.MULTILINE,
+)
+for path in sys.stdin.read().splitlines():
+    if not path:
+        continue
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        continue
+    new = RE.sub(lambda m: f"{m.group(1)}\x27{m.group(2)}\x27{m.group(3)}", text)
+    if new != text:
+        open(path, "w", encoding="utf-8").write(new)
+        print(path)
+')
+  if [[ -n "$FIXED_PATHS" ]]; then
+    while IFS= read -r f; do [[ -n "$f" ]] && git add -- "$f"; done <<< "$FIXED_PATHS"
+    echo "[pre-commit] Auto-quoted tz-aware datetimes in $(printf '%s\n' "$FIXED_PATHS" | grep -c .) pkgsinfo file(s)"
+  fi
+fi
 
 # ── M1: structural pkgsinfo linter ─────────────────────────
 if [[ -x "$LINT_SCRIPT" ]] && command -v python3 >/dev/null 2>&1; then
@@ -171,6 +203,28 @@ if [[ -n "$MISSING_PKGS" ]]; then
   makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT"
 
   MISSING_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
+
+  # ── superseded-pkgsinfo resolution ──────────────────────
+  # An older pkgsinfo whose .pkg was retired by `repoclean --keep N` can't be
+  # downloaded (the object is gone too). If a strictly newer version of the same
+  # package is present locally with its installer intact, delete the dead
+  # pkgsinfo (capped, newest-safe) and re-validate instead of blocking.
+  RESOLVER="$HOOK_DIR/../lib/resolve-superseded-pkgsinfo.py"
+  if [[ -n "$MISSING_RECHECK" && -f "$RESOLVER" ]] && command -v python3 >/dev/null 2>&1; then
+    RESOLVER_OUT=$(printf '%s\n' "$MISSING_RECHECK" | \
+      python3 "$RESOLVER" --repo-root "$REPO_ROOT" --apply 2>/dev/null || true)
+    SUPERSEDED_COUNT=$(echo "$RESOLVER_OUT" | python3 -c \
+      'import json,sys;print(len(json.load(sys.stdin).get("superseded",[])))' 2>/dev/null || echo 0)
+    if (( SUPERSEDED_COUNT > 0 )); then
+      echo "[pre-commit] Removed ${SUPERSEDED_COUNT} superseded pkgsinfo (newer version present locally)."
+      git add -A deployment/pkgsinfo 2>/dev/null || true
+      rm -f "$MAKECATALOGS_OUTPUT"
+      MAKECATALOGS_OUTPUT=$(mktemp)
+      makecatalogs --silent "$DEPLOYMENT" 2>&1 | tee "$MAKECATALOGS_OUTPUT"
+      MISSING_RECHECK=$(grep -E "WARNING:.*refers to missing installer item:" "$MAKECATALOGS_OUTPUT" || true)
+    fi
+  fi
+
   if [[ -n "$MISSING_RECHECK" ]]; then
     STILL=$(echo "$MISSING_RECHECK" | wc -l | tr -d ' ')
     rm -f "$MAKECATALOGS_OUTPUT"

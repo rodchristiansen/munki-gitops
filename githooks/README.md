@@ -18,6 +18,7 @@ Both use the same hook names, same flags, same env-var bypass, same safety guard
 | `.min-version`                    | Enforced floor — every hook warns if older than this YYYY.MM.DD. |
 | `lib/common.sh`                   | Shared helpers: version check, worktree linker, size guard, lock. |
 | `lib/pkgsinfo-lint.py`            | Structural pkgsinfo validator (Munki-native schema).             |
+| `lib/resolve-superseded-pkgsinfo.py` | Auto-removes older pkgsinfo whose installer was retired by `repoclean`, when a newer version is present locally. |
 | `azure/pre-commit`                | Validate pkgsinfo, auto-download missing pkgs, block bad commits. |
 | `azure/pre-push`                  | Sync changes to Azure Blob, remove orphans from blob storage.    |
 | `azure/post-merge`                | Download packages referenced by newly-pulled pkgsinfo.           |
@@ -96,10 +97,12 @@ Also honoured: `git pull --no-verify`, `git merge --no-verify` — parsed out of
 2. **Concurrency lock** — prevents overlap with `pre-push`; stale locks auto-steal.
 3. **Binary-size guard** — rejects staged files >50 MB outside recognised pkg/icon paths.
 4. **Worktree cache link** — silent no-op in primary worktree; symlinks cloud caches in linked worktrees.
-5. **Structural pkgsinfo linter** — catches typos, wrong-case keys, invalid `installer_type`, `nopkg` install-loop traps, `RequireRestart`+`unattended_install` combos. 47 valid top-keys, full enum validation. See `lib/pkgsinfo-lint.py` for the full schema.
-6. **`makecatalogs` validation** — parse errors, missing required keys, invalid item locations, empty catalogs.
-7. **Missing-pkg auto-download** — pulls the referenced installer items from cloud storage; blocks only if still missing after download.
-8. **Orphan pkg cleanup** — main branch only, capped at 10 deletions (prevents catastrophic mass-delete on partial branches).
+5. **Datetime auto-quote** — rewrites unquoted tz-aware ISO8601 scalars (`creation_date: 2026-04-22T17:51:22Z`) to quoted strings in staged pkgsinfo and re-stages them. Unquoted, PyYAML loads them as tz-aware `datetime` objects that crash any consumer comparing them against a naive datetime (a catalog promoter, a report script). Silent, idempotent.
+6. **Structural pkgsinfo linter** — catches typos, wrong-case keys, invalid `installer_type`, `nopkg` install-loop traps, `RequireRestart`+`unattended_install` combos. 47 valid top-keys, full enum validation. See `lib/pkgsinfo-lint.py` for the full schema.
+7. **`makecatalogs` validation** — parse errors, missing required keys, invalid item locations, empty catalogs.
+8. **Missing-pkg auto-download** — pulls the referenced installer items from cloud storage; blocks only if still missing after download.
+9. **Superseded-pkgsinfo resolution** — if a package is still "missing" after download, it's usually an older pkgsinfo whose `.pkg` was retired by `repoclean --keep N` (the blob is gone too, so downloading is futile). When a strictly newer version of the *same* package is present locally with its installer intact, the old pkgsinfo is dead weight: `lib/resolve-superseded-pkgsinfo.py` deletes it (newest-version-safe, capped at `SUPERSEDED_CLEANUP_CAP`=50) and re-validates instead of blocking the commit.
+10. **Orphan pkg cleanup** — main branch only, capped at 10 deletions (prevents catastrophic mass-delete on partial branches).
 
 ### `pre-push`
 
