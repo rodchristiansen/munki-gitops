@@ -1,0 +1,112 @@
+# Manifest tree -> Intune. Thin: every stage is a module under intune/stages/.
+#
+# The lint stage has dependsOn: [] and gates everything, because the failure it
+# catches -- a condition that cannot be translated, skipped in silence -- is
+# invisible once the run is underway.
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - intune/manifests/**
+      - intune/profiles/**
+
+parameters:
+  - name: whatIf
+    displayName: 'Plan only: log every write instead of making it'
+    type: boolean
+    default: true
+  - name: allowLargeShrink
+    displayName: 'Permit a removal batch above the cap'
+    type: boolean
+    default: false
+
+variables:
+  - name: azureServiceConnection
+    value: '$(INTUNE_SERVICE_CONNECTION)'
+
+stages:
+  - stage: lint
+    displayName: 'Lint manifest conditions'
+    dependsOn: []
+    jobs:
+      - job: lint
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - script: pip install pyyaml
+            displayName: 'Dependencies'
+          - script: python3 -m stages.lint_conditions manifests/
+            workingDirectory: intune
+            displayName: 'Every condition must translate'
+
+  - stage: test
+    displayName: 'Test'
+    dependsOn: lint
+    jobs:
+      - job: test
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - script: pip install pyyaml
+            displayName: 'Dependencies'
+          - script: python3 tests/test_intune.py
+            workingDirectory: intune
+            displayName: 'Assignment and translation guards'
+          - script: python3 tests/test_group_ladder.py
+            workingDirectory: enrollment
+            displayName: 'Group membership guards'
+
+  - stage: plan
+    displayName: 'Plan'
+    dependsOn: test
+    jobs:
+      - job: plan
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - script: pip install pyyaml
+            displayName: 'Dependencies'
+          - script: python3 -m stages.plan_assignments manifests/
+            workingDirectory: intune
+            displayName: 'Assignments this tree implies'
+
+  - stage: apply
+    displayName: 'Apply'
+    dependsOn: plan
+    condition: and(succeeded(), eq('${{ parameters.whatIf }}', false))
+    jobs:
+      - job: apply
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            fetchDepth: 1
+          - script: pip install pyyaml requests
+            displayName: 'Dependencies'
+          - task: AzureCLI@2
+            displayName: 'Acquire Graph token'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                TOKEN=$(az account get-access-token \
+                  --resource https://graph.microsoft.com \
+                  --query accessToken -o tsv)
+                echo "##vso[task.setvariable variable=GRAPH_TOKEN;issecret=true]$TOKEN"
+          - script: python3 -m stages.apply_assignments manifests/
+            workingDirectory: intune
+            displayName: 'Write assignments'
+            env:
+              GRAPH_TOKEN: $(GRAPH_TOKEN)
+              WHATIF: ${{ parameters.whatIf }}
+              ALLOW_LARGE_SHRINK: ${{ parameters.allowLargeShrink }}

@@ -1,0 +1,44 @@
+# A Settings Catalog / Declarative Device Management policy authored as YAML.
+#
+# Apple deprecated the MDM software-update workload, so update policy has to be
+# DDM. Authoring it here rather than clicking through a settings picker means it
+# diffs, reviews and deploys like everything else in the repo.
+#
+# Assignments are group NAMES; the pipeline resolves them to ids at deploy time.
+displayName: "Software Update - Shared"
+description: "Deferred update enforcement for shared and lab Macs. Excludes kiosks."
+platform: macOS
+technologies: "mdm,appleRemoteManagement"
+roleScopeTagIds:
+  - 0
+
+assignments:
+  include:
+    - Devices-Shared
+  exclude:
+    - Devices-Shared-Kiosk
+
+settingsCatalog:
+  - id: softwareupdate_softwareupdate
+    kind: group
+    children:
+      - id: softwareupdate_automaticactions
+        kind: group
+        children:
+          - id: softwareupdate_automaticactions_download
+            kind: choice
+            value: softwareupdate_automaticactions_download_1
+          - id: softwareupdate_automaticactions_installsecurityupdate
+            kind: choice
+            value: softwareupdate_automaticactions_installsecurityupdate_1
+      - id: softwareupdate_deferrals
+        kind: group
+        children:
+          # Hold major OS upgrades back 90 days after release (range 1-90)
+          - id: softwareupdate_deferrals_majorperiodindays
+            kind: integer
+            value: 90
+          # Hold minor OS updates back 30 days after release (range 1-90)
+          - id: softwareupdate_deferrals_minorperiodindays
+            kind: integer
+            value: 30

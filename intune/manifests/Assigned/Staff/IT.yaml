@@ -1,0 +1,9 @@
+# Maps to Devices-Assigned-Staff-IT.
+managed_installs:
+- ExampleAdminTools
+
+managed_profiles:
+- AdminTerminalPrefs
+
+managed_apps:
+- Remote Desktop

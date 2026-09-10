@@ -1,0 +1,30 @@
+# Every 1:1 device. Maps to Devices-Assigned.
+#
+# The first four keys are Munki's and Munki acts on them. The last three are
+# read only by this kit's pipeline and ignored by the client, which is what
+# lets one reviewed file describe both what the agent does and what MDM does.
+catalogs:
+- Production
+
+managed_installs:
+- Chrome
+- Firefox
+
+managed_uninstalls:
+- OldSecurityAgent
+
+managed_updates:
+- Chrome
+- Firefox
+
+managed_apps:
+- Keynote
+- Numbers
+- Pages
+
+managed_profiles:
+- GlobalPrefs
+- AssignedSoftwareUpdate
+
+managed_scripts:
+- RemediateAgentOwnership

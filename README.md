@@ -48,4 +48,61 @@ We’ve split this into two core flows:
 - A daemon listens for messages and runs `git pull` and syncs assets
 - CloudFront serves files globally or from on-prem caches
 
+## Inventory, groups and manifests
+
+The sections above are about how the *repo* works — storage split, hooks, catalogs,
+CDN. Three further layers cover what the repo becomes a source of truth for:
+Entra groups, configuration profiles, and App Store apps.
+
+```
+inventory/     the twelve-column contract, a sample fleet, and the projection script
+enrollment/    one consumer per system; the Intune one builds the group ladder
+intune/        renders three manifest keys the client ignores into Intune
+```
+
+**The idea.** Four inventory columns — `usage`, `catalog`, `area`, `location` —
+are one hierarchy. At enrollment they become five nested Entra groups. Munki
+manifests live in a directory tree built from the same columns. So:
+
+```
+manifests/Assigned/Staff/IT.yaml   <->   Devices-Assigned-Staff-IT
+```
+
+A manifest path and a group name are the same address written twice, and both
+derive from the same row, so they cannot drift.
+
+Which means a manifest can carry keys Munki ignores and have them mean something:
+
+| Key | Renders to |
+|---|---|
+| `managed_apps` | VPP / App Store apps — the one thing Munki genuinely cannot install |
+| `managed_profiles` | `.mobileconfig` and Settings Catalog / DDM policies |
+| `managed_scripts` | Shell scripts |
+
+One reviewed file describes what the agent does *and* what MDM does.
+
+**Try it offline.** No tenant, no credentials, PyYAML the only dependency:
+
+```
+python3 inventory/projections/project.py inventory/inventory.csv --out-dir out/
+cd enrollment && python3 -m consumers.intune ../out/intune.csv --what-if
+cd ../intune && python3 -m stages.lint_conditions manifests/
+python3 -m stages.plan_assignments manifests/
+```
+
+With no `GRAPH_TOKEN` the Intune consumer prints the group plan and stops. Run
+that first, before handing it anything.
+
+**Guards.** Adding is safe; removing is not. Every stage derives a desired state
+by parsing something, and a degraded parse yields an *empty* desired set rather
+than an error — a well-formed answer that removes everything on a green build.
+So there is a floor on the desired set, a cap on how much one run may remove,
+ownership markers so only this pipeline's own objects are touched, and `whatIf`
+as a supported way to run. Read each layer's README before pointing it at a
+tenant.
+
+The Windows half of this pattern is
+[cimian-gitops](https://github.com/windowsadmins/cimian-gitops): same keys, same
+path-to-group rule, same guards, different render targets.
+
 Want to talk shop or ask questions? Connect with me on [BlueSky](https://bsky.app/profile/rodchristiansen.net) or on the [Blog](https://focused.systems).

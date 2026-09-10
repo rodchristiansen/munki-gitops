@@ -1,0 +1,28 @@
+# Every multi-user / lab device. Maps to Devices-Shared.
+catalogs:
+- Production
+
+managed_installs:
+- Chrome
+- Firefox
+
+conditional_items:
+- condition: os_vers_major >= 15
+  managed_installs:
+  - ExampleAppNeedingCurrentOS
+  managed_profiles:
+  - ModernOSPrefs
+
+- condition: machine_type == "laptop"
+  managed_profiles:
+  - LaptopPowerPrefs
+
+managed_apps:
+- Keynote
+
+managed_profiles:
+- GlobalPrefs
+- SharedSoftwareUpdate
+
+managed_scripts:
+- ClearSoftwareCaches
