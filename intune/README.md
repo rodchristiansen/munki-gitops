@@ -49,6 +49,25 @@ python3 -m stages.lint_conditions tests/fixtures/broken/
 
 Five findings, exit 1.
 
+## Two pipelines in here, on purpose
+
+`pipelines/azure/` and `pipelines/github/` are thin: every stage is a module
+under `stages/`. That is the recommended shape and the one to read first.
+
+`pipelines/reference/` is the production pipeline, lifted nearly as-is and
+sanitized. It is there for accuracy, not as a model — several thousand lines of
+script inline in YAML is exactly why the test suite has to test extracted logic
+rather than the file that ships, and why the condition translator exists twice
+in it with a comment between the copies saying "keep these in sync". Come here
+when you want to see how it is really wired, or what a stage does that the
+sample omits.
+
+Sanitized means: service connection, variable group, storage account and
+container names are placeholders, and the Teams webhook reads from a variable
+group. If you lift your own, check that last one especially — a Power Automate
+URL with a `sig=` parameter is a working credential, and a pipeline file is not
+where it belongs.
+
 ## Stages
 
 | Stage | Does |
