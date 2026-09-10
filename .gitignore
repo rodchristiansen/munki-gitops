@@ -2,3 +2,8 @@
 preflight/swift/src/.build
 /preflight/swift/payload/preflight
 preflight/**/build
+
+out/
+.cache/
+__pycache__/
+*.pyc
