@@ -2,7 +2,12 @@
 
 The manifest tree becomes MDM state. Three keys the client ignores —
 `managed_apps`, `managed_profiles`, `managed_scripts` — ride along in the same
-reviewed YAML, and this layer renders them into Intune.
+reviewed YAML, and this layer renders them into Intune: VPP apps, mobileconfig
+and Settings Catalog profiles, and shell scripts.
+
+The Windows half of the same pattern lives in
+[cimian-gitops](https://github.com/windowsadmins/cimian-gitops). Same keys, same
+path-to-group rule, same guards; only the render targets differ.
 
 **This writes to a live tenant.** Every stage plans before it writes, and
 `WHATIF=true` is a supported way to run rather than a debug flag. Run the plan
