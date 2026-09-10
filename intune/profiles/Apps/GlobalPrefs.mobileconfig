@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadDisplayName</key>
+  <string>GlobalPrefs</string>
+  <key>PayloadIdentifier</key>
+  <string>com.example.gitops.GlobalPrefs</string>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>00000000-0000-0000-0000-00000000A001</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+  <key>PayloadScope</key>
+  <string>System</string>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadDisplayName</key>
+      <string>Global preferences</string>
+      <key>PayloadIdentifier</key>
+      <string>com.example.gitops.GlobalPrefs.payload</string>
+      <key>PayloadType</key>
+      <string>com.apple.SoftwareUpdate</string>
+      <key>PayloadUUID</key>
+      <string>00000000-0000-0000-0000-00000000A002</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>AutomaticCheckEnabled</key>
+      <true/>
+    </dict>
+  </array>
+</dict>
+</plist>

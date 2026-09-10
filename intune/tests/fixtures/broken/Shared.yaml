@@ -1,0 +1,31 @@
+# Every rule the linter enforces, one manifest. Used by the test suite; this is
+# what a build failure is supposed to look like.
+conditional_items:
+
+# Rule 1 -- no filter equivalent. This used to be skipped in silence.
+- condition: arch == "arm64"
+  managed_profiles:
+  - AppleSiliconPrefs
+
+# Rule 1 -- looks supported, is not: filter `model` is the marketing name.
+- condition: machine_model == "MacBookPro16,1"
+  managed_profiles:
+  - SpecificHardwarePrefs
+
+# Rule 2 -- malformed.
+- condition: os_vers_major >=
+  managed_profiles:
+  - BrokenPrefs
+
+# Rule 3 -- managed_apps under a condition is never read.
+- condition: os_vers_major >= 15
+  managed_apps:
+  - Keynote
+
+# Rule 4 -- translates, but emits an operator the platform rejects on model.
+- condition: machine_type != "laptop"
+  managed_scripts:
+  - DesktopOnlyScript
+
+managed_profiles:
+- GlobalPrefs
