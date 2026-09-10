@@ -39,8 +39,8 @@ trigger:
 # check-in (~8h+). This schedule runs the group-membership sync + a drift-aware
 # force-sync only (the push/assign stages are gated off via ReconcileOnly), so
 # newly-enrolled/migrated Macs converge on a bounded cadence instead of by luck.
-# PAUSED 2026-07-22. This schedule has run harmlessly for months, but PR 10407
-# changed what a run does: membership now converges fully with no cap on
+# PAUSED. This schedule ran harmlessly for months, but a later change altered
+# what a run does: membership now converges fully with no cap on
 # removals. Until that behaviour is proven against real data, a timer that can
 # unassign config profiles from Macs every two hours is not something to leave
 # running. Re-enable once the group-sync test suite passes and the removal
