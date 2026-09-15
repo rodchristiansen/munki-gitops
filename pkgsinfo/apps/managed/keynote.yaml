@@ -1,0 +1,13 @@
+name: Keynote
+source: apple_vpp
+store_id: "409183694"
+bundle_id: com.apple.Keynote
+assignment:
+  intent: required
+  device_licensing: true
+  prevent_auto_update: false
+catalogs:
+- Development
+- Testing
+- Staging
+- Production

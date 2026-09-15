@@ -1,0 +1,13 @@
+name: Example Available App
+source: apple_vpp
+store_id: "000000000"
+bundle_id: com.example.availableapp
+assignment:
+  intent: available
+  device_licensing: true
+  prevent_auto_update: false
+catalogs:
+- Development
+- Testing
+- Staging
+- Production
