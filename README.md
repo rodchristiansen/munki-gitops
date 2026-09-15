@@ -1,4 +1,4 @@
-# Running Munki under DevOps model
+# Running Munki under a GitOps model
 
 **MacDevOps YVR 2025 presentation Companion Repo** - [YouTube link](https://www.youtube.com/watch?v=ayQqGT9S_cM&t=6s&pp=ygUQcm9kIGNocmlzdGlhbnNlbg%3D%3D)
 
@@ -7,7 +7,7 @@ Repo has samples of how we rebuilt our Munki ops to be fully Git with hooks, CI/
 **Cloud Provider Options**: This repo includes implementations for both **Azure** (Azure DevOps, Azure Storage, Service Bus) and **AWS** (GitHub Actions/CodePipeline, S3, SQS/SNS). Choose the cloud provider that fits your infrastructure.
 
 
-## From Manual to DevOps
+## From manual to GitOps
 
 The legacy flow was:
 
@@ -30,7 +30,7 @@ Now we have:
 
 We’ve split this into two core flows:
 
-### Munki DevOps Infrastructure
+### Munki GitOps infrastructure
 
 **Azure Implementation:**
 - Admins commit to a shared Azure DevOps repo with `manifests/` and `pkgsinfo/`
@@ -80,6 +80,30 @@ Which means a manifest can carry keys Munki ignores and have them mean something
 | `managed_scripts` | Shell scripts |
 
 One reviewed file describes what the agent does *and* what MDM does.
+
+### Catalog-staged Intune releases
+
+Machine-manifest `catalogs` identify an endpoint's cohort. Each profile, script,
+and managed-app descriptor has a separate cumulative `catalogs` array that
+declares how far that artifact has been promoted:
+
+```yaml
+catalogs:
+- Development
+- Testing
+- Staging
+```
+
+Promotion is a reviewed edit to that array; it is never time-driven. The
+pipeline automates only the mechanics: a changed profile or script becomes a
+hash-identified candidate, the previous Production object remains assigned to
+later cohorts, and the predecessor is retired only when the source explicitly
+includes Production. A `.mobileconfig` carries its catalog array as a top-level
+`Catalogs` key which the pipeline validates and strips before upload. Every
+Apple payload's `PayloadVersion` must remain integer `1`; the candidate hash is
+stored in Intune metadata instead. VPP identifiers and assignment metadata live
+under `pkgsinfo/apps/managed/`, not in the pipeline body. New release-controller
+logic stays inline in the pipeline YAML so deployment remains self-contained.
 
 **Try it offline.** No tenant, no credentials, PyYAML the only dependency:
 

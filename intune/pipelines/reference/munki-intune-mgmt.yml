@@ -983,7 +983,43 @@ stages:
                   safeDispName="$(echo "$displayName" | sed 's/[^A-Za-z0-9_]/_/g')"
                   staleDispName="${safeDispName}_STALE"
                   echo "Using unsigned file: $file"
-                  payload_b64="$(base64 -i "$file")"
+                  sanitized_profile="$(mktemp)"
+                  catalogs_csv="$(python3 - "$file" "$sanitized_profile" <<'PY'
+                import pathlib
+                import plistlib
+                import sys
+
+                source = pathlib.Path(sys.argv[1])
+                destination = pathlib.Path(sys.argv[2])
+                profile = plistlib.loads(source.read_bytes())
+                expected = ["Development", "Testing", "Staging", "Production"]
+                catalogs = profile.pop("Catalogs", [])
+                if not catalogs or catalogs != expected[:len(catalogs)]:
+                    raise SystemExit(
+                        f"{source}: Catalogs must be a non-empty cumulative prefix of {expected}")
+
+                def validate(value, location=""):
+                    if isinstance(value, dict):
+                        if "PayloadType" in value:
+                            version = value.get("PayloadVersion")
+                            if type(version) is not int or version != 1:
+                                raise SystemExit(
+                                    f"{source}: {location}/PayloadVersion must be integer 1")
+                        for key, child in value.items():
+                            validate(child, f"{location}/{key}")
+                    elif isinstance(value, list):
+                        for index, child in enumerate(value):
+                            validate(child, f"{location}/{index}")
+
+                validate(profile)
+                destination.write_bytes(
+                    plistlib.dumps(profile, fmt=plistlib.FMT_XML, sort_keys=False))
+                print(",".join(catalogs))
+                PY
+                  )"
+                  payload_b64="$(base64 -i "$sanitized_profile")"
+                  rm -f "$sanitized_profile"
+                  echo "Catalog availability: $catalogs_csv"
                   # Stable hash of *what we send* (displayName + payload), stamped into
                   # the description as a [munki-sync-hash:...] marker. The existing-profile
                   # branch below skips the PATCH when the remote marker already matches, so
@@ -3652,46 +3688,28 @@ stages:
                 GRAPH_BETA = "https://graph.microsoft.com/beta"
                 MANIFESTS_ROOT = "deployment/manifests"  # Adjust to your folder
                 
-                # Enhanced VPP apps configuration with version control
-                # Uses bundleId for matching since appStoreUrl is not available on macOS VPP apps
-                # Name in a manifest -> what the API needs to find the app.
-                #
-                # Trimmed to a few entries for this sample. The real table is a
-                # statement about what one organisation licenses, so build your
-                # own. Match on bundleId: macOS VPP app objects do not reliably
-                # carry an appStoreUrl, so a lookup built on it works for iOS
-                # examples and quietly matches nothing on Mac.
-                VPP_APPS_CONFIG = {
-                    "Keynote": {
-                        "store_id": "409183694",
-                        "bundle_id": "com.apple.Keynote",
+                VPP_APPS_CONFIG = {}
+                waterfall = ["Development", "Testing", "Staging", "Production"]
+                for path in glob.glob("pkgsinfo/apps/managed/*.yaml"):
+                    with open(path, encoding="utf-8") as stream:
+                        metadata = yaml.safe_load(stream) or {}
+                    if metadata.get("source") != "apple_vpp":
+                        continue
+                    catalogs = metadata.get("catalogs") or []
+                    if not catalogs or catalogs != waterfall[:len(catalogs)]:
+                        raise ValueError(
+                            f"{path}: catalogs must be a cumulative Development-to-Production prefix")
+                    definition = {
+                        "store_id": str(metadata["store_id"]),
+                        "bundle_id": metadata["bundle_id"],
                         "version_control": {
-                            "prevent_auto_update": False,
-                            "assignment_intent": "required",
-                            # Device licensing, so the app installs on shared and
-                            # unattended machines with no Apple Account signed in.
-                            "use_device_licensing": True
-                        }
-                    },
-                    "Pages": {
-                        "store_id": "409201541",
-                        "bundle_id": "com.apple.Pages",
-                        "version_control": {
-                            "prevent_auto_update": False,
-                            "assignment_intent": "required",
-                            "use_device_licensing": True
-                        }
-                    },
-                    "Example Available App": {
-                        "store_id": "000000000",
-                        "bundle_id": "com.example.availableapp",
-                        "version_control": {
-                            "prevent_auto_update": False,
-                            "assignment_intent": "available",
-                            "use_device_licensing": True
-                        }
+                            "prevent_auto_update": metadata["assignment"].get("prevent_auto_update", False),
+                            "assignment_intent": metadata["assignment"]["intent"],
+                            "use_device_licensing": metadata["assignment"].get("device_licensing", True),
+                        },
                     }
-                }
+                    for name in [metadata["name"], *metadata.get("aliases", [])]:
+                        VPP_APPS_CONFIG[name] = definition
                 
                 class GraphAPIClient:
                     def __init__(self, token):

@@ -7,6 +7,7 @@ on:
     paths:
       - 'intune/manifests/**'
       - 'intune/profiles/**'
+      - 'pkgsinfo/apps/managed/**'
   workflow_dispatch:
     inputs:
       whatIf:
@@ -35,6 +36,34 @@ jobs:
       - run: pip install pyyaml
       - run: python3 tests/test_intune.py
         working-directory: intune
+      - name: Catalog and PayloadVersion invariants
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import plistlib
+          import yaml
+
+          waterfall = ["Development", "Testing", "Staging", "Production"]
+          yaml_paths = list(pathlib.Path("intune/profiles").rglob("*.yaml"))
+          yaml_paths += list(pathlib.Path("pkgsinfo/apps/managed").rglob("*.yaml"))
+          for path in yaml_paths:
+              catalogs = (yaml.safe_load(path.read_text()) or {}).get("catalogs") or []
+              if not catalogs or catalogs != waterfall[:len(catalogs)]:
+                  raise SystemExit(f"{path}: catalogs must be a cumulative waterfall prefix")
+          for path in pathlib.Path("intune/profiles").rglob("*.mobileconfig"):
+              profile = plistlib.loads(path.read_bytes())
+              catalogs = profile.get("Catalogs") or []
+              if not catalogs or catalogs != waterfall[:len(catalogs)]:
+                  raise SystemExit(f"{path}: Catalogs must be a cumulative waterfall prefix")
+              def validate(value):
+                  if isinstance(value, dict):
+                      if "PayloadType" in value and (type(value.get("PayloadVersion")) is not int or value["PayloadVersion"] != 1):
+                          raise SystemExit(f"{path}: every PayloadVersion must be integer 1")
+                      for child in value.values(): validate(child)
+                  elif isinstance(value, list):
+                      for child in value: validate(child)
+              validate(profile)
+          PY
       - run: python3 tests/test_group_ladder.py
         working-directory: enrollment
 

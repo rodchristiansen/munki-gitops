@@ -12,6 +12,7 @@ trigger:
     include:
       - intune/manifests/**
       - intune/profiles/**
+      - pkgsinfo/apps/managed/**
 
 parameters:
   - name: whatIf
@@ -59,6 +60,36 @@ stages:
           - script: python3 tests/test_intune.py
             workingDirectory: intune
             displayName: 'Assignment and translation guards'
+          - script: |
+              python3 - <<'PY'
+              import pathlib
+              import plistlib
+              import yaml
+
+              waterfall = ["Development", "Testing", "Staging", "Production"]
+              for path in pathlib.Path("intune/profiles").rglob("*.yaml"):
+                  catalogs = (yaml.safe_load(path.read_text()) or {}).get("catalogs") or []
+                  if not catalogs or catalogs != waterfall[:len(catalogs)]:
+                      raise SystemExit(f"{path}: catalogs must be a cumulative waterfall prefix")
+              for path in pathlib.Path("pkgsinfo/apps/managed").rglob("*.yaml"):
+                  catalogs = (yaml.safe_load(path.read_text()) or {}).get("catalogs") or []
+                  if not catalogs or catalogs != waterfall[:len(catalogs)]:
+                      raise SystemExit(f"{path}: catalogs must be a cumulative waterfall prefix")
+              for path in pathlib.Path("intune/profiles").rglob("*.mobileconfig"):
+                  profile = plistlib.loads(path.read_bytes())
+                  catalogs = profile.get("Catalogs") or []
+                  if not catalogs or catalogs != waterfall[:len(catalogs)]:
+                      raise SystemExit(f"{path}: Catalogs must be a cumulative waterfall prefix")
+                  def validate(value):
+                      if isinstance(value, dict):
+                          if "PayloadType" in value and (type(value.get("PayloadVersion")) is not int or value["PayloadVersion"] != 1):
+                              raise SystemExit(f"{path}: every PayloadVersion must be integer 1")
+                          for child in value.values(): validate(child)
+                      elif isinstance(value, list):
+                          for child in value: validate(child)
+                  validate(profile)
+              PY
+            displayName: 'Catalog and PayloadVersion invariants'
           - script: python3 tests/test_group_ladder.py
             workingDirectory: enrollment
             displayName: 'Group membership guards'

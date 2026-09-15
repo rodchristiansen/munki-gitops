@@ -1,0 +1,13 @@
+name: Pages
+source: apple_vpp
+store_id: "409201541"
+bundle_id: com.apple.Pages
+assignment:
+  intent: required
+  device_licensing: true
+  prevent_auto_update: false
+catalogs:
+- Development
+- Testing
+- Staging
+- Production

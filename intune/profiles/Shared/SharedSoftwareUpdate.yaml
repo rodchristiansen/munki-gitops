@@ -9,6 +9,7 @@ displayName: "Software Update - Shared"
 description: "Deferred update enforcement for shared and lab Macs. Excludes kiosks."
 platform: macOS
 technologies: "mdm,appleRemoteManagement"
+catalogs: [Development, Testing, Staging, Production]
 roleScopeTagIds:
   - 0
 
