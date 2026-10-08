@@ -1,0 +1,244 @@
+#!/usr/bin/env zsh
+# HOOK_VERSION=2026.10.07
+#
+# ──────────────────────────────────────────────────────────────────────────────
+#  pre-push-pr-packages  –  branch pushes: make every package a pushed pkgsinfo
+#  needs exist in S3, create-only.
+#
+#  The S3 twin of githooks/azure/pre-push-pr-packages. For each pkgsinfo the
+#  pushed commits add or change it:
+#
+#    • uploads the local package if the object is absent, with
+#      --if-none-match '*' so a concurrent upload cannot be overwritten, and
+#      the pkgsinfo's SHA-256 in object metadata;
+#    • accepts an existing object only when its sha256 metadata matches;
+#    • refuses to replace a package key that holds different bytes;
+#    • backfills sha256 metadata on a legacy object only when its identity is
+#      proven, by a single-part ETag matching the local file's MD5 or by
+#      origin/main already assigning that hash to that key;
+#    • skips nopkg, profile and apple_update_metadata items and Intune
+#      descriptors under apps/managed.
+#
+#  It never deletes anything. Single PUTs are limited to 5 GB; upload a larger
+#  package from main with `git push -- --path <file>`.
+#
+#  Config: MUNKI_S3_BUCKET, MUNKI_S3_PREFIX, MUNKI_AWS_REGION.
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+set -f
+
+BASE="$(git rev-parse --show-toplevel)"
+S3_BUCKET="${MUNKI_S3_BUCKET:-your-munki-bucket}"
+S3_PREFIX="${MUNKI_S3_PREFIX:-}"
+AWS_REGION="${MUNKI_AWS_REGION:-${AWS_REGION:-us-east-1}}"
+KEY_ROOT="${S3_PREFIX:+$S3_PREFIX/}deployment/pkgs"
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+changed_file_list=$(mktemp)
+trap 'rm -f "$changed_file_list"' EXIT
+
+collect_changed_pkgsinfo() {
+  local saw_ref=false line local_ref local_sha remote_ref remote_sha base range
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    saw_ref=true
+    read -r local_ref local_sha remote_ref remote_sha <<< "$line"
+    [[ -z "${remote_sha:-}" ]] && { print -u2 "ERROR: Cannot parse pre-push ref: $line"; return 1; }
+    [[ "$local_sha" == "$ZERO_SHA" ]] && continue
+    if [[ "$remote_sha" == "$ZERO_SHA" ]]; then
+      base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || {
+        print -u2 "ERROR: Cannot determine the branch point from origin/main."
+        return 1
+      }
+      range="$base..$local_sha"
+    else
+      range="$remote_sha..$local_sha"
+    fi
+    git diff --diff-filter=ACMR --name-only "$range" -- deployment/pkgsinfo/ >> "$changed_file_list"
+  done
+  [[ "$saw_ref" == false ]] && print -u2 "[pre-push] No refs are being pushed; nothing to validate."
+  return 0
+}
+
+extract_field() {
+  local key="$1" file="$2" value
+  value=$(grep -E "^${key}:[[:space:]]*" "$file" 2>/dev/null | head -1 \
+    | sed -E "s/^${key}:[[:space:]]*//" | tr -d '"' | tr -d "'" || true)
+  if [[ -z "$value" ]]; then
+    value=$(grep -A1 "<key>${key}</key>" "$file" 2>/dev/null \
+      | grep '<string>' | head -1 \
+      | sed -E 's#.*<string>(.*)</string>.*#\1#' || true)
+  fi
+  print -r -- "$value"
+}
+
+normalise_location() {
+  local loc="$1" seg
+  loc="${loc#deployment/pkgs/}"
+  loc="${loc#pkgs/}"
+  [[ -n "$loc" && "$loc" != /* && "$loc" != *[[:cntrl:]]* && "$loc" != *\\* ]] || return 1
+  for seg in "${(@s:/:)loc}"; do
+    [[ -n "$seg" && "$seg" != "." && "$seg" != ".." ]] || return 1
+  done
+  print -r -- "$loc"
+}
+
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
+
+md5_hex() { openssl dgst -md5 "$1" | awk '{print $NF}'; }
+
+# Prints "<etag>\t<sha256-metadata>" for an object. 0 exists, 1 absent,
+# 2 could not tell.
+HEAD_OUT=""
+head_object() {
+  local out
+  if out=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$1" --region "$AWS_REGION" \
+      --query '[ETag, Metadata.sha256]' --output text 2>&1); then
+    HEAD_OUT="$out"
+    return 0
+  fi
+  [[ "$out" == *"Not Found"* || "$out" == *"404"* ]] && return 1
+  return 2
+}
+
+head_etag() { print -r -- "${${HEAD_OUT%%$'\t'*}//\"/}"; }
+head_sha256() {
+  local v="${HEAD_OUT#*$'\t'}"
+  [[ "$v" == None ]] && v=""
+  print -r -- "${v:l}"
+}
+
+backfill_sha256_metadata() {
+  local key="$1" hash="$2" etag="$3"
+  aws s3api copy-object --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" \
+    --copy-source "$S3_BUCKET/$key" --copy-source-if-match "\"$etag\"" \
+    --metadata-directive REPLACE --metadata "sha256=$hash" \
+    --cache-control "public, max-age=31536000, immutable" >/dev/null 2>&1
+}
+
+main_sha256_for_location() {
+  local wanted="$1" candidate temp loc hash found=""
+  local -a candidates
+  candidates=("${(@f)$(git grep -l -F -- "$wanted" origin/main -- deployment/pkgsinfo/ 2>/dev/null || true)}")
+  for candidate in "${candidates[@]}"; do
+    [[ -z "$candidate" ]] && continue
+    temp=$(mktemp)
+    if ! git show "$candidate" > "$temp" 2>/dev/null; then rm -f "$temp"; continue; fi
+    loc=$(normalise_location "$(extract_field installer_item_location "$temp")" || true)
+    hash=$(extract_field installer_item_hash "$temp"); hash="${hash:l}"
+    rm -f "$temp"
+    [[ "$loc" == "$wanted" && ${#hash} -eq 64 ]] || continue
+    if [[ -n "$found" && "$found" != "$hash" ]]; then print -r -- conflict; return 0; fi
+    found="$hash"
+  done
+  print -r -- "$found"
+}
+
+collect_changed_pkgsinfo
+sort -u "$changed_file_list" -o "$changed_file_list"
+[[ ! -s "$changed_file_list" ]] && exit 0
+
+command -v aws >/dev/null 2>&1 || { print -u2 "ERROR: the AWS CLI is required to verify the packages this push references."; exit 1; }
+aws sts get-caller-identity --region "$AWS_REGION" >/dev/null 2>&1 || {
+  print -u2 "ERROR: AWS sign-in is required to verify the packages this push references (aws sso login)."
+  exit 1
+}
+
+failures=0
+fail() { print -u2 "ERROR: $1"; failures=$(( failures + 1 )); }
+
+while IFS= read -r pkgsinfo; do
+  [[ -f "$BASE/$pkgsinfo" ]] || continue
+  [[ "$pkgsinfo" == deployment/pkgsinfo/apps/managed/* ]] && continue
+  case "$(extract_field installer_type "$BASE/$pkgsinfo")" in
+    nopkg|profile|apple_update_metadata) continue ;;
+  esac
+
+  raw_location=$(extract_field installer_item_location "$BASE/$pkgsinfo")
+  [[ -n "$raw_location" ]] || { fail "$pkgsinfo has no installer_item_location."; continue; }
+  location=$(normalise_location "${raw_location#/}") || { fail "$pkgsinfo has an unsafe installer_item_location: $raw_location"; continue; }
+
+  expected_hash=$(extract_field installer_item_hash "$BASE/$pkgsinfo"); expected_hash="${expected_hash:l}"
+  if [[ ${#expected_hash} -ne 64 || "$expected_hash" == *[^0-9a-f]* ]]; then
+    fail "$pkgsinfo has no valid SHA-256 installer_item_hash."
+    continue
+  fi
+
+  local_path="$BASE/deployment/pkgs/$location"
+  key="$KEY_ROOT/$location"
+
+  head_status=0
+  head_object "$key" || head_status=$?
+  if (( head_status == 2 )); then fail "Could not check S3 for $key."; continue; fi
+
+  if (( head_status == 0 )); then
+    remote_hash=$(head_sha256)
+    if [[ "$remote_hash" == "$expected_hash" ]]; then
+      print "[pre-push] Package already in S3: $location"
+      continue
+    fi
+    if [[ -n "$remote_hash" ]]; then
+      fail "Refusing to replace immutable package key $location (S3 $remote_hash, pkgsinfo $expected_hash)."
+      continue
+    fi
+
+    main_hash=$(main_sha256_for_location "$location")
+    if [[ "$main_hash" == conflict || ( -n "$main_hash" && "$main_hash" != "$expected_hash" ) ]]; then
+      fail "origin/main assigns a different SHA-256 to $location."
+      continue
+    fi
+    etag=$(head_etag)
+    proven=false
+    [[ "$main_hash" == "$expected_hash" ]] && proven=true
+    # A single-part upload's ETag is the object's MD5; a multipart one has a
+    # -N suffix and proves nothing.
+    if [[ "$proven" == false && -f "$local_path" && "$etag" != *-* ]] \
+        && [[ "$(sha256_of "$local_path")" == "$expected_hash" && "$(md5_hex "$local_path")" == "$etag" ]]; then
+      proven=true
+    fi
+    if [[ "$proven" == false ]]; then
+      fail "Object $location has no SHA-256 identity and nothing proves it matches $pkgsinfo."
+      continue
+    fi
+    if backfill_sha256_metadata "$key" "$expected_hash" "$etag"; then
+      print "[pre-push] Recorded SHA-256 on legacy object: $location"
+    elif head_object "$key" && [[ "$(head_sha256)" == "$expected_hash" ]]; then
+      print "[pre-push] Another checkout recorded the same SHA-256: $location"
+    else
+      fail "Object $location changed while its identity was being recorded."
+    fi
+    continue
+  fi
+
+  if [[ ! -f "$local_path" ]]; then
+    fail "$pkgsinfo references a package absent locally and in S3: deployment/pkgs/$location"
+    continue
+  fi
+  if [[ "$(sha256_of "$local_path")" != "$expected_hash" ]]; then
+    fail "SHA-256 of deployment/pkgs/$location does not match $pkgsinfo."
+    continue
+  fi
+
+  print "[pre-push] Uploading package for $pkgsinfo: $location"
+  if aws s3api put-object --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" \
+      --body "$local_path" --if-none-match '*' --metadata "sha256=$expected_hash" \
+      --cache-control "public, max-age=31536000, immutable" >/dev/null; then
+    :
+  elif head_object "$key" && [[ "$(head_sha256)" == "$expected_hash" ]]; then
+    print "[pre-push] Another checkout uploaded the same package: $location"
+  else
+    fail "Upload of $location failed or collided with different bytes."
+  fi
+done < "$changed_file_list"
+
+if (( failures > 0 )); then
+  print -u2 "[pre-push] Push blocked: $failures package reference(s) unresolved."
+  exit 1
+fi
+print "[pre-push] Every package this push references is in S3."

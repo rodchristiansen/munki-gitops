@@ -1,5 +1,0 @@
-#!/bin/bash
-
-# Keep permissions properly set
-chown root:wheel /usr/local/munki/preflight
-chmod 755 /usr/local/munki/preflight

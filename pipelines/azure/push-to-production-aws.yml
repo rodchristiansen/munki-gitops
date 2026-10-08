@@ -1,4 +1,21 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  push-to-production-aws.yml — publish the Munki repo to S3 + CloudFront from
+#  Azure Pipelines.
+#
+#  Same shape as push-to-production-azure.yml: rebuild the catalogs, refuse to
+#  publish if any pkgsinfo points at a package that is not in the bucket, sync
+#  catalogs, manifests and pkgsinfo, and invalidate the metadata paths at the
+#  edge.
+#
+#  Auth is an AWS Toolkit service connection. Configure it to assume an IAM
+#  role through OIDC so no access key is stored; the role needs s3:ListBucket,
+#  s3:GetObject, s3:PutObject and s3:DeleteObject on the bucket and
+#  cloudfront:CreateInvalidation on the distribution. Every name below is a
+#  placeholder.
+# ──────────────────────────────────────────────────────────────────────────────
+
 trigger:
+  batch: true
   branches:
     include:
       - main
@@ -7,16 +24,24 @@ trigger:
       - /deployment/**
 
 pool:
-  vmImage: macOS-13
+  vmImage: macOS-latest
 
 variables:
-  - group: munki-repo-secrets
-  - name: S3_BUCKET_NAME       # e.g. munki-prod-bucket
-    value: '<your-bucket>'
-  - name: AWS_DISTRIBUTION_ID  # CloudFront distribution
-    value: '<E123ABCXYZ>'
-  - name: REPO_PATH
-    value: '/deployment'
+  - name: awsServiceConnection
+    value: '<aws-service-connection>'
+  - name: AWS_REGION
+    value: 'us-east-1'
+  - name: S3_BUCKET
+    value: 'example-munki-bucket'
+  - name: S3_PREFIX                        # optional key prefix; empty for the bucket root
+    value: ''
+  - name: CLOUDFRONT_DISTRIBUTION_ID
+    value: '<distribution-id>'
+  # Pinned Munki tools release; see push-to-production-azure.yml.
+  - name: MUNKITOOLS_URL
+    value: 'https://github.com/munki/munki/releases/download/v7.3.0/munkitools-7.3.0.5808.pkg'
+  - name: MUNKITOOLS_SHA256
+    value: '4ed826bd32811ef54524a10300f66c9af4c9fdd8c243ada146d468485e1bffcc'
 
 stages:
 - stage: PushMunkiRepo
@@ -25,56 +50,102 @@ stages:
     steps:
     - checkout: self
       clean: true
-      persistCredentials: true
+      fetchDepth: 1
 
-    - script: |
-        git sparse-checkout init --cone
-        git sparse-checkout set deployment pipelines
-      displayName: Sparse checkout
+    - bash: |
+        set -euo pipefail
+        cd "$AGENT_TEMPDIRECTORY"
+        curl -fsSL -o munkitools.pkg "$MUNKITOOLS_URL"
+        echo "$MUNKITOOLS_SHA256  munkitools.pkg" | shasum -a 256 -c -
+        pkgutil --expand-full munkitools.pkg munkitools
+        MC="$PWD/$(find munkitools -path '*/usr/local/munki/makecatalogs' -type f | head -1)"
+        [ -f "$MC" ] && [ -x "$MC" ] || { echo "makecatalogs not found in the package"; exit 1; }
+        "$MC" --version
+        echo "##vso[task.setvariable variable=MAKECATALOGS]$MC"
+      displayName: Install pinned makecatalogs
 
-    - script: |
-        brew install --cask git-credential-manager
-        brew install munki
-      displayName: Install Munki tools (Homebrew)
-
-    - script: |
-        /usr/local/munki/makecatalogs --skip-pkg-check \
-          "$(Build.SourcesDirectory)$(REPO_PATH)"
+    - bash: |
+        set -euo pipefail
+        REPO="$BUILD_SOURCESDIRECTORY/deployment"
+        HELD="$(mktemp -d)/managed"
+        restore() { [ -d "$HELD" ] && mv "$HELD" "$REPO/pkgsinfo/apps/managed" || true; }
+        trap restore EXIT
+        [ -d "$REPO/pkgsinfo/apps/managed" ] && mv "$REPO/pkgsinfo/apps/managed" "$HELD"
+        if ! "$MAKECATALOGS" --skip-pkg-check "$REPO"; then
+          if find "$REPO/pkgsinfo" -name '*.yaml' -o -name '*.yml' | grep -q .; then
+            echo "##vso[task.logissue type=error]This repo has YAML pkgsinfo; point MUNKITOOLS_URL at a YAML-capable makecatalogs."
+          fi
+          exit 1
+        fi
+        restore; trap - EXIT
+        ls "$REPO/catalogs/all" >/dev/null 2>&1 || { echo "##vso[task.logissue type=error]makecatalogs wrote no catalogs"; exit 1; }
+        if grep -R -l -E 'source:[[:space:]]+apple_vpp|<string>apple_vpp</string>' "$REPO/catalogs"; then
+          echo "##vso[task.logissue type=error]An Intune managed-app descriptor reached a Munki catalog."
+          exit 1
+        fi
       displayName: Run makecatalogs
 
-    - script: |
-        find "$(Build.SourcesDirectory)/deployment/pkgs" \
-             -type f -name '*.pkg.*' -delete
-      displayName: Sanitize /pkgs folder
-
-    - task: AWSCLI@1
+    - task: AWSShellScript@1
+      displayName: 'Gate: every pkgsinfo package exists in S3'
       inputs:
-        awsCredentials: AWS Credentials
-        regionName: ca-central-1
-        awsCommand: s3
-        awsSubCommand: sync
-        awsArguments: |
-          $(Build.SourcesDirectory)/deployment/catalogs \
-          s3://$(S3_BUCKET_NAME)/repo/deployment/catalogs --delete
-      displayName: Sync catalogs
+        awsCredentials: $(awsServiceConnection)
+        regionName: $(AWS_REGION)
+        scriptType: inline
+        inlineScript: |
+          set -euo pipefail
+          ROOT="${S3_PREFIX:+$S3_PREFIX/}deployment"
+          SRC="$BUILD_SOURCESDIRECTORY/deployment"
+          LIST="$AGENT_TEMPDIRECTORY/s3-pkgs.txt"
+          aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$ROOT/pkgs/" \
+            --query 'Contents[].Key' --output text | tr '\t' '\n' | grep -v '^None$' > "$LIST" || true
+          echo "$(wc -l < "$LIST" | tr -d ' ') package object(s) in the bucket"
 
-    - task: AWSCLI@1
-      inputs:
-        awsCredentials: AWS Credentials
-        regionName: ca-central-1
-        awsCommand: s3
-        awsSubCommand: sync
-        awsArguments: |
-          $(Build.SourcesDirectory)/deployment/{manifests,pkgsinfo} \
-          s3://$(S3_BUCKET_NAME)/repo/deployment/ --delete
-      displayName: Sync manifests + pkgsinfo
+          GATE="$(mktemp -d)"
+          mkdir -p "$GATE/pkgs" "$GATE/pkgsinfo"
+          rsync -a --exclude '/apps/managed/' "$SRC/pkgsinfo/" "$GATE/pkgsinfo/"
+          while IFS= read -r key; do
+            rel="${key#$ROOT/pkgs/}"
+            [ -n "$rel" ] && [ "$rel" != "$key" ] || continue
+            case "/$rel/" in */../*) echo "Skipping unsafe key: $key"; continue ;; esac
+            mkdir -p "$(dirname "$GATE/pkgs/$rel")"
+            : > "$GATE/pkgs/$rel"
+          done < "$LIST"
 
-    - task: AWSCLI@1
+          LOG="$AGENT_TEMPDIRECTORY/gate.log"
+          "$MAKECATALOGS" "$GATE" > "$LOG" 2>&1 || true
+          if grep -q 'refers to missing installer item:' "$LOG"; then
+            echo "##vso[task.logissue type=error]Deploy blocked: pkgsinfo reference packages that are not in S3."
+            grep 'refers to missing installer item:' "$LOG" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "Every referenced package is in S3."
+
+    # Packages are uploaded by the hooks, create-only; this pipeline only owns
+    # metadata. The catalogs sync deliberately does not delete.
+    - task: AWSShellScript@1
+      displayName: Sync catalogs, manifests and pkgsinfo
       inputs:
-        awsCredentials: AWS Credentials
-        regionName: us-east-1
-        awsCommand: cloudfront
-        awsSubCommand: create-invalidation
-        awsArguments: |
-          --distribution-id $(AWS_DISTRIBUTION_ID) --paths "/*"
-      displayName: Invalidate CloudFront
+        awsCredentials: $(awsServiceConnection)
+        regionName: $(AWS_REGION)
+        scriptType: inline
+        inlineScript: |
+          set -euo pipefail
+          DEST="s3://$S3_BUCKET/${S3_PREFIX:+$S3_PREFIX/}deployment"
+          SRC="$BUILD_SOURCESDIRECTORY/deployment"
+          aws s3 sync "$SRC/catalogs" "$DEST/catalogs" --only-show-errors
+          for d in manifests pkgsinfo; do
+            aws s3 sync "$SRC/$d" "$DEST/$d" --delete --exclude '*.DS_Store' --only-show-errors
+          done
+
+    # Metadata paths only; packages are version-named and never stale.
+    - task: AWSShellScript@1
+      displayName: Invalidate CloudFront (metadata only)
+      inputs:
+        awsCredentials: $(awsServiceConnection)
+        regionName: $(AWS_REGION)
+        scriptType: inline
+        inlineScript: |
+          set -euo pipefail
+          P="/${S3_PREFIX:+$S3_PREFIX/}deployment"
+          aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "$P/catalogs/*" "$P/manifests/*" "$P/pkgsinfo/*" "$P/icons/*"

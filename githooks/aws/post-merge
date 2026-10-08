@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.19
+# HOOK_VERSION=2026.10.07
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  post-merge hook  –  targeted package downloads after git pull/merge (AWS S3)
@@ -21,7 +21,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "post-merge" "2026.04.19"
+check_hook_version "post-merge" "2026.10.07"
 should_skip_hook "post-merge" && exit 0
 link_worktree_sync_caches
 

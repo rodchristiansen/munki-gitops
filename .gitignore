@@ -1,9 +1,23 @@
 .DS_Store
-preflight/swift/src/.build
-/preflight/swift/payload/preflight
-preflight/**/build
+
+# munkipkg build output
+**/build/
+
+# Node listeners
+node_modules/
+npm-debug.log*
+
+# Local secrets — never commit
+*.p12
+*.pem
+*.key
+*.env
+*.env.*
 
 out/
 .cache/
 __pycache__/
 *.pyc
+
+# Task worktrees
+/.worktrees/
