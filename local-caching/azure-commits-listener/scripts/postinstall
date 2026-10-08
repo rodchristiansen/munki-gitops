@@ -17,7 +17,9 @@ if [[ -z "$NPM" ]]; then
   exit 1
 fi
 chown -R "$RUN_AS" "$APP_DIR"
-/usr/bin/sudo -u "$RUN_AS" -H "$NPM" install --prefix "$APP_DIR" --omit=dev --no-audit --no-fund
+# npm is a "#!/usr/bin/env node" script, and the installer's PATH has no
+# Homebrew directory, so hand npm a PATH that finds the node beside it.
+/usr/bin/sudo -u "$RUN_AS" -H /usr/bin/env PATH="${NPM:h}:/usr/bin:/bin:/usr/sbin:/sbin" "$NPM" install --prefix "$APP_DIR" --omit=dev --no-audit --no-fund
 
 /bin/launchctl bootstrap system "$PLIST"
 /bin/launchctl enable system/com.domain.CommitsListener

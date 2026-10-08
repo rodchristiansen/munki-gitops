@@ -163,6 +163,8 @@ typeset -A ROW
 # Columns are found by header name, so the projection may reorder them. Fields
 # must not contain commas; the projection never writes one.
 fetch_inventory_row() {
+  # The field trimming below uses # (zero or more), an extended glob.
+  setopt local_options extended_glob
   local serial="$1" csv http_status curl_rc header row i source="$REPO_URL"
   local -a names values
   csv=$(mktemp -t munki-inventory)

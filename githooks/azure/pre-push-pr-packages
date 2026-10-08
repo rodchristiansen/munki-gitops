@@ -240,19 +240,19 @@ while IFS= read -r pkgsinfo; do
   fi
   command -v azcopy >/dev/null 2>&1 || { fail "azcopy is required to upload $location."; continue; }
 
+  # azcopy exits 0 when --overwrite=false skips a blob that appeared since the
+  # existence check, so success alone proves nothing: read back the SHA-256.
   print "[pre-push] Uploading package for $pkgsinfo: $location"
-  if azcopy copy "$local_path" "$STORAGE_URL/$blob_path" \
+  upload_status=0
+  azcopy copy "$local_path" "$STORAGE_URL/$blob_path" \
       --put-md5 --overwrite=false --metadata="sha256=$expected_hash" \
-      --log-level=ERROR --output-level=essential; then
-    az storage blob update --account-name "$STORAGE_ACCOUNT" \
-      --container-name "$CONTAINER" --name "$blob_path" --auth-mode login \
-      --content-cache-control "public, max-age=31536000, immutable" \
-      --only-show-errors >/dev/null || print -u2 "WARNING: could not set Cache-Control on $location"
-  elif [[ "$(blob_property "$blob_path" metadata.sha256 || true)" == "$expected_hash" ]]; then
+      --cache-control="public, max-age=31536000, immutable" \
+      --log-level=ERROR --output-level=essential || upload_status=$?
+  if [[ "$(blob_property "$blob_path" metadata.sha256 || true)" != "$expected_hash" ]]; then
+    fail "Upload of $location failed or collided with different bytes."
+  elif (( upload_status != 0 )); then
     # Another checkout won the create-only race with the same bytes.
     print "[pre-push] Another checkout uploaded the same package: $location"
-  else
-    fail "Upload of $location failed or collided with different bytes."
   fi
 done < "$changed_file_list"
 

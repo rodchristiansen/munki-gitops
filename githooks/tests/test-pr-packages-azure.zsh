@@ -58,6 +58,14 @@ if [ -f "$HOOK_TEST_STATE/fail-upload" ]; then
   cat "$HOOK_TEST_STATE/race-sha" > "$HOOK_TEST_STATE/sha256"
   exit 1
 fi
+# --overwrite=false skipping a blob that appeared since the check still exits 0.
+if [ -f "$HOOK_TEST_STATE/skip-upload" ]; then
+  cat "$HOOK_TEST_STATE/race-sha" > "$HOOK_TEST_STATE/sha256"
+  exit 0
+fi
+for arg in "$@"; do
+  case "$arg" in --metadata=sha256=*) printf '%s\n' "${arg#--metadata=sha256=}" > "$HOOK_TEST_STATE/sha256" ;; esac
+done
 : > "$HOOK_TEST_STATE/uploaded"
 exit 0
 SH
@@ -75,7 +83,8 @@ reset_remote() {
   print -r -- "${2:-}" > "$HOOK_TEST_STATE/sha256"
   print -r -- "${3:-}" > "$HOOK_TEST_STATE/md5"
   rm -f "$HOOK_TEST_STATE/uploaded" "$HOOK_TEST_STATE/backfilled" \
-    "$HOOK_TEST_STATE/azcopy-args" "$HOOK_TEST_STATE/fail-upload" "$HOOK_TEST_STATE/race-sha"
+    "$HOOK_TEST_STATE/azcopy-args" "$HOOK_TEST_STATE/fail-upload" "$HOOK_TEST_STATE/skip-upload" \
+    "$HOOK_TEST_STATE/race-sha"
 }
 fail() { print -u2 "FAIL: $1"; exit 1; }
 
@@ -89,6 +98,7 @@ run_hook || fail 'a local package should upload'
 [[ -f "$HOOK_TEST_STATE/uploaded" ]] || fail 'expected an upload'
 grep -q -- '--overwrite=false' "$HOOK_TEST_STATE/azcopy-args" || fail 'upload must be create-only'
 grep -q -- "--metadata=sha256=$EXPECTED_HASH" "$HOOK_TEST_STATE/azcopy-args" || fail 'upload must carry its SHA-256'
+grep -q -- '--cache-control=public, max-age=31536000, immutable' "$HOOK_TEST_STATE/azcopy-args" || fail 'upload must set Cache-Control'
 [[ $(wc -l < "$HOOK_TEST_STATE/azcopy-args") -eq 1 ]] || fail 'nopkg and managed descriptors must not upload'
 
 print -n other > "$FIXTURE/deployment/pkgs/apps/Test.pkg"
@@ -130,6 +140,10 @@ reset_remote false
 : > "$HOOK_TEST_STATE/fail-upload"
 print -r -- "$OTHER_HASH" > "$HOOK_TEST_STATE/race-sha"
 run_hook && fail 'losing a create race to different bytes must block'
+reset_remote false
+: > "$HOOK_TEST_STATE/skip-upload"
+print -r -- "$OTHER_HASH" > "$HOOK_TEST_STATE/race-sha"
+run_hook && fail 'a create-only skip over different bytes must block'
 
 for bad in '../../etc/passwd' '/etc/passwd' 'apps/../../x.pkg' 'apps//x.pkg'; do
   sed -i.bak "s#^installer_item_location:.*#installer_item_location: $bad#" "$FIXTURE/deployment/pkgsinfo/apps/Test.yaml"
