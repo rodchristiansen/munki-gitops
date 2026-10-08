@@ -39,7 +39,12 @@ manifest. Keep the retire statuses in step with `RETIRE_STATUSES` in
 The script reuses Munki's own `AdditionalHttpHeaders`, so a repo behind Basic
 or Bearer auth needs no second credential. The headers reach curl through a
 0600 config file, never on its command line, where any local user could read
-them from the process list.
+them from the process list. They are only sent over https: a mirror on plain
+http is probed without them, and the inventory CSV, which decides this Mac's
+names and manifest, is always read over https, from the cloud repo when the
+selected mirror is http. Each inventory value that becomes part of
+`ClientIdentifier` must be a plain path segment (letters, digits, `.`, `_`,
+`-`), so a bad row cannot point the Mac at another tree's manifest.
 
 ## Override
 

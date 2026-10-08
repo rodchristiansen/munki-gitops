@@ -84,7 +84,16 @@ printf 'HTTP/1.1 200 OK\r\nLast-Modified: %s\r\n' "$old" > "$FAKE_STATE/headers-
 printf 'HTTP/1.1 200 OK\r\nLast-Modified: %s\r\n' "$now" > "$FAKE_STATE/headers-m2.test"
 if [[ "$(uname)" == Darwin ]]; then
   REPO_URL=""; configure_repository 2>/dev/null
-  [[ "$REPO_URL" == "http://m2.test/deployment" ]] || fail "expected the fresh mirror, got $REPO_URL"
+  [[ "$REPO_URL" == "https://m2.test/deployment" ]] || fail "expected the fresh mirror, got $REPO_URL"
+  grep -q Authorization "$FAKE_STATE/last-config" || fail 'https probe sent no credential'
+
+  # A plain-http mirror is probed without the credential.
+  MIRROR_SCHEME=http
+  REPO_URL=""; configure_repository 2>/dev/null
+  [[ "$REPO_URL" == "http://m2.test/deployment" ]] || fail "expected the http mirror, got $REPO_URL"
+  if grep -q Authorization "$FAKE_STATE/last-config"; then fail 'credential sent over http'; fi
+  MIRROR_SCHEME=https
+
   rm -f "$FAKE_STATE/headers-m2.test"
   REPO_URL=""; configure_repository 2>/dev/null
   [[ "$REPO_URL" == "$CLOUD_REPO_URL" ]] || fail "expected the cloud fallback, got $REPO_URL"
@@ -107,6 +116,17 @@ fetch_inventory_row SAMPLEMAC001 2>/dev/null || fail 'row not found'
 
 fetch_inventory_row SAMPLEMAC009 2>/dev/null
 [[ "$(derive_client_identifier)" == "Shared/Curriculum/Design/LAB9" ]] || fail 'empty location not dropped'
+
+# Inventory is never read from a plain-http mirror.
+REPO_URL="http://m2.test/deployment"
+fetch_inventory_row SAMPLEMAC001 2>/dev/null || fail 'row not found via the cloud fallback'
+[[ "$(cat "$FAKE_STATE/last-url")" == "$CLOUD_REPO_URL/enroll/computers.csv" ]] || fail 'CSV read over http'
+REPO_URL="$CLOUD_REPO_URL"
+
+# A row value that is not a plain path segment never reaches ClientIdentifier.
+fetch_inventory_row SAMPLEMAC001 2>/dev/null
+ROW[area]="../Other"
+if derive_client_identifier 2>/dev/null; then fail 'path traversal accepted'; fi
 
 # A truncated download (curl timed out after a 200) is not a download.
 print 28 > "$FAKE_STATE/curl-rc"

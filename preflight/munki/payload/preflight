@@ -34,16 +34,20 @@ PS4=''
 # Everything an organisation changes lives here.
 
 # Local caching servers, in order of preference, and the cloud fallback. Each
-# mirror serves the repo at http://<host>/deployment.
+# mirror serves the repo at <scheme>://<host>/deployment. Request headers (the
+# repo credential) are only ever sent over https, so a mirror on plain http
+# must serve the repo without authentication.
 MIRROR_HOSTS=(mirror1.example.org mirror2.example.org)
-MIRROR_SCHEME="http"
+MIRROR_SCHEME="https"
 CLOUD_REPO_URL="https://munki.example.org/deployment"
 
 # What the freshness probe fetches, and how old it may be.
 MIRROR_TEST_PATH="catalogs/Production.yaml"
 MIRROR_MAX_AGE_SECS=$(( 48 * 3600 ))
 
-# Where the inventory projection lives inside the repo.
+# Where the inventory projection lives inside the repo. It decides this Mac's
+# names and manifest, so it is only read over https: when the selected repo is
+# a plain-http mirror, the inventory comes from the cloud repo instead.
 INVENTORY_CSV_PATH="enroll/computers.csv"
 
 # Manifests a device sits on while it is still being provisioned. Preflight
@@ -84,8 +88,15 @@ in_list() {
 # Bearer Authorization header). They go to curl through a 0600 config file,
 # never on its command line, where any local user could read them from ps.
 CURL_CONFIG=$(mktemp -t munki-preflight)
-chmod 600 "$CURL_CONFIG"
-trap 'rm -f "$CURL_CONFIG"' EXIT
+CURL_ANON=$(mktemp -t munki-preflight-anon)
+chmod 600 "$CURL_CONFIG" "$CURL_ANON"
+trap 'rm -f "$CURL_CONFIG" "$CURL_ANON"' EXIT
+
+# curl_config_for <url>: the header config for https, an empty one otherwise,
+# so the credential never crosses the network in cleartext.
+curl_config_for() {
+  [[ "$1" == https://* ]] && print -r -- "$CURL_CONFIG" || print -r -- "$CURL_ANON"
+}
 
 load_request_headers() {
   local plist i header
@@ -109,7 +120,7 @@ load_request_headers() {
 # within MIRROR_MAX_AGE_SECS.
 mirror_is_fresh() {
   local base="$1" headers http_status lastmod lm_epoch now_epoch
-  headers=$(curl -K "$CURL_CONFIG" -Is -m 3 "$base/$MIRROR_TEST_PATH" 2>/dev/null) || return 1
+  headers=$(curl -K "$(curl_config_for "$base")" -Is -m 3 "$base/$MIRROR_TEST_PATH" 2>/dev/null) || return 1
   http_status=$(print -r -- "$headers" | head -1 | awk '{print $2}')
   [[ "$http_status" == "200" ]] || { log_detail "$base: catalog probe returned HTTP ${http_status:-none}"; return 1; }
   lastmod=$(print -r -- "$headers" | awk -F': ' 'tolower($1)=="last-modified"{print $2}' | tr -d '\r')
@@ -152,19 +163,28 @@ typeset -A ROW
 # Columns are found by header name, so the projection may reorder them. Fields
 # must not contain commas; the projection never writes one.
 fetch_inventory_row() {
-  local serial="$1" csv http_status curl_rc header row i
+  local serial="$1" csv http_status curl_rc header row i source="$REPO_URL"
   local -a names values
   csv=$(mktemp -t munki-inventory)
 
   # Fetch from the repo selected above: a stale mirror's CSV would re-enrol
-  # this Mac under whoever owned the serial months ago.
-  http_status=$(curl -K "$CURL_CONFIG" -s -w '%{http_code}' -o "$csv" -m 20 "$REPO_URL/$INVENTORY_CSV_PATH")
+  # this Mac under whoever owned the serial months ago. A plain-http mirror is
+  # not trusted for it, because anyone on the path could rewrite the row.
+  if [[ "$source" != https://* ]]; then
+    source="$CLOUD_REPO_URL"
+    log_detail "Selected repo is not https; reading inventory from $source"
+  fi
+  if [[ "$source" != https://* ]]; then
+    log_error "No https source for inventory; skipping the lookup"
+    rm -f "$csv"; return 1
+  fi
+  http_status=$(curl -K "$CURL_CONFIG" --proto '=https' -s -w '%{http_code}' -o "$csv" -m 20 "$source/$INVENTORY_CSV_PATH")
   curl_rc=$?
   # A transfer cut off by the timeout still reports 200 and leaves a truncated
   # file, and a serial missing from the cut-off tail reads as "not enrolled".
   # Only curl exit 0 and HTTP 200 together count as a download.
   if [[ $curl_rc -ne 0 || "$http_status" != "200" ]]; then
-    log_error "Inventory download failed from $REPO_URL (HTTP ${http_status:-none}, curl exit $curl_rc)"
+    log_error "Inventory download failed from $source (HTTP ${http_status:-none}, curl exit $curl_rc)"
     [[ "$http_status" == "401" || "$http_status" == "403" ]] && log_error "Check AdditionalHttpHeaders in ManagedInstalls"
     rm -f "$csv"; return 1
   fi
@@ -242,16 +262,24 @@ set_client_identifier() {
 }
 
 # usage/catalog/area/location/hostname, dropping an empty location. The parent
-# of this path is the area manifest the Entra group ladder mirrors.
+# of this path is the area manifest the Entra group ladder mirrors. Each part
+# must be a plain path segment: a value like "../Other" from a bad row would
+# otherwise point this Mac at a manifest outside its own tree.
 derive_client_identifier() {
   local -a parts
-  local key
-  for key in usage catalog area location hostname; do
-    [[ -n "${ROW[$key]:-}" ]] && parts+=("${ROW[$key]// /}")
-  done
+  local key part
   if [[ -z "${ROW[usage]:-}" || -z "${ROW[catalog]:-}" || -z "${ROW[area]:-}" || -z "${ROW[hostname]:-}" ]]; then
     return 1
   fi
+  for key in usage catalog area location hostname; do
+    [[ -n "${ROW[$key]:-}" ]] || continue
+    part="${ROW[$key]// /}"
+    if [[ ! "$part" =~ '^[A-Za-z0-9._-]+$' || "$part" == (.|..) ]]; then
+      log_warn "Inventory $key '${ROW[$key]}' is not a valid manifest path segment"
+      return 1
+    fi
+    parts+=("$part")
+  done
   print -r -- "${(j:/:)parts}"
 }
 
