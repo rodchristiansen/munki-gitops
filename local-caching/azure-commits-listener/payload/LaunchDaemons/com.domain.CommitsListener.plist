@@ -2,31 +2,42 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Disabled</key>
-    <false/>
-    <key>KeepAlive</key>
-    <true/>
     <key>Label</key>
     <string>com.domain.CommitsListener</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/node</string>
+        <string>/usr/bin/env</string>
+        <string>node</string>
         <string>/Library/Management/CommitsListener/service-bus-listener.js</string>
     </array>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>UserName</key>
-    <string>admin</string>
     <key>WorkingDirectory</key>
     <string>/Library/Management/CommitsListener/</string>
-    <key>StartInterval</key>
-    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>UserName</key>
+    <string>admin</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
         <string>/Users/admin</string>
-        <key>USER</key>
-        <string>admin</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>MUNKI_REPO_URL</key>
+        <string>https://git.example.com/org/munki-repo.git</string>
+        <key>MUNKI_WORKING_COPY</key>
+        <string>/Users/Shared/munki-repo</string>
+        <key>MUNKI_SB_NAMESPACE</key>
+        <string>example-namespace.servicebus.windows.net</string>
+        <key>MUNKI_SB_TOPIC</key>
+        <string>munki-commits</string>
+        <key>MUNKI_SB_SUB</key>
+        <string>cache-server-1</string>
+        <key>MUNKI_BLOB_URL</key>
+        <string>https://examplestorage.blob.core.windows.net/munki</string>
     </dict>
 </dict>
 </plist>

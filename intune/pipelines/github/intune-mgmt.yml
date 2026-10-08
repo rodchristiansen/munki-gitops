@@ -15,15 +15,20 @@ on:
         type: boolean
         default: true
 
+# id-token: write is granted only to the apply job, which runs in a protected
+# environment. Make the federated credential's subject that environment
+# (repo:<owner>/<repo>:environment:intune-production), so a workflow edited on
+# another branch cannot mint a token.
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: pip install pyyaml
       - run: python3 -m stages.lint_conditions manifests/
         working-directory: intune
@@ -32,7 +37,9 @@ jobs:
     needs: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: pip install pyyaml
       - run: python3 tests/test_intune.py
         working-directory: intune
@@ -71,7 +78,9 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: pip install pyyaml
       - run: python3 -m stages.plan_assignments manifests/
         working-directory: intune
@@ -80,14 +89,20 @@ jobs:
     needs: plan
     if: github.event_name == 'push' || inputs.whatIf == false
     runs-on: ubuntu-latest
+    environment: intune-production
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - run: pip install pyyaml requests
-      - uses: azure/login@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          persist-credentials: false
+      - run: pip install pyyaml requests
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Write assignments
         working-directory: intune
         run: |

@@ -1,3 +1,24 @@
 #!/bin/zsh
-sudo launchctl enable system/com.domain.CommitsListener
-sudo launchctl load /Library/LaunchDaemons/com.domain.CommitsListener.plist
+set -euo pipefail
+
+PLIST="/Library/LaunchDaemons/com.domain.CommitsListener.plist"
+APP_DIR="/Library/Management/CommitsListener"
+
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+
+# The package ships source only. Install the SDK dependencies here, as the
+# account the daemon runs as, so a node_modules built on another Mac (or for
+# another architecture) never lands on this one.
+RUN_AS=$(/usr/libexec/PlistBuddy -c 'Print :UserName' "$PLIST")
+NPM=$(PATH=/opt/homebrew/bin:/usr/local/bin:$PATH command -v npm || true)
+if [[ -z "$NPM" ]]; then
+  echo "npm not found; install Node.js 20 or later and reinstall this package." >&2
+  exit 1
+fi
+chown -R "$RUN_AS" "$APP_DIR"
+/usr/bin/sudo -u "$RUN_AS" -H "$NPM" install --prefix "$APP_DIR" --omit=dev --no-audit --no-fund
+
+/bin/launchctl bootstrap system "$PLIST"
+/bin/launchctl enable system/com.domain.CommitsListener
+exit 0

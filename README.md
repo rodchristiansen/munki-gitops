@@ -2,9 +2,13 @@
 
 **MacDevOps YVR 2025 presentation Companion Repo** - [YouTube link](https://www.youtube.com/watch?v=ayQqGT9S_cM&t=6s&pp=ygUQcm9kIGNocmlzdGlhbnNlbg%3D%3D)
 
-Repo has samples of how we rebuilt our Munki ops to be fully Git with hooks, CI/CD pipelines, message queues, and local caching servers.
+Samples of running Munki entirely from Git: hooks, CI/CD pipelines, message
+queues and local caching servers, with inventory driving Entra groups,
+manifests and Intune assignments.
 
-**Cloud Provider Options**: This repo includes implementations for both **Azure** (Azure DevOps, Azure Storage, Service Bus) and **AWS** (GitHub Actions/CodePipeline, S3, SQS/SNS). Choose the cloud provider that fits your infrastructure.
+Each piece ships for **Azure** (Azure Pipelines or GitHub Actions, Blob
+Storage, Front Door, Service Bus) and **AWS** (Azure Pipelines or GitHub
+Actions, S3, CloudFront, SQS). Pick the cloud that fits your infrastructure.
 
 
 ## From manual to GitOps
@@ -19,34 +23,68 @@ The legacy flow was:
 
 Now we have:
 
-- Git repos and CI/CD pipelines (Azure DevOps or GitHub Actions/AWS CodePipeline)
+- Git repos and CI/CD pipelines (Azure Pipelines or GitHub Actions)
 - Git hooks that upload/download packages automatically (Azure Storage or S3)
 - Separate working copies per admin
 - Local caching servers that sync intelligently
 - A full CI/CD system that integrates with inventory and deploys via pull requests
 
 
-## Architecture Overview
+## What is here
 
-We’ve split this into two core flows:
+| Path | What it is |
+|---|---|
+| `githooks/` | Git hooks for an Azure Blob (`azure/`) or S3 (`aws/`) backed repo: pkgsinfo lint, package download on pull, create-only package upload on branch pushes, sync and capped orphan cleanup on main. See its README. |
+| `pipelines/` | Push-to-production pipelines for Azure Pipelines (`azure/`) and GitHub Actions (`github/`), each against Azure Blob + Front Door or S3 + CloudFront. |
+| `preflight/munki/` | A zsh preflight: picks a fresh local mirror or the cloud repo, looks the Mac up in inventory and sets its names and `ClientIdentifier`. |
+| `local-caching/` | Commits listeners for on-prem caching servers: Azure Service Bus or SQS triggers a `git` refresh and a package sync. |
+| `inventory/`, `enrollment/`, `intune/` | Inventory as the source of truth for Entra groups, manifests and Intune assignments (below). |
+| `pkgsinfo/apps/managed/` | Sample Intune VPP app descriptors. |
 
-### Munki GitOps infrastructure
+## How a change reaches the fleet
 
-**Azure Implementation:**
-- Admins commit to a shared Azure DevOps repo with `manifests/` and `pkgsinfo/`
-- Git hooks (post-commit/merge) run `azcopy sync` to upload or download packages
-- A pipeline (`munki-push-production.yml`) builds catalogs and updates Azure Storage
-- Local caching servers are notified via Azure Service Bus
-- A daemon listens for commits and runs `git pull` and syncs assets
-- CDN serves files globally or from on-prem caches
+1. An admin works on a branch in their own clone. `pre-commit` lints the
+   pkgsinfo and runs `makecatalogs`; `post-merge` downloads the packages new
+   pkgsinfo reference.
+2. Pushing the branch uploads any package its pkgsinfo need, create-only and
+   keyed by SHA-256, so the merge never references a package storage lacks.
+   A package path is immutable: different bytes need a new path.
+3. The pull request merges to `main`. The push pipeline rebuilds the catalogs
+   with a pinned `makecatalogs`, refuses to publish if any pkgsinfo points at a
+   package that is not in storage, syncs catalogs, manifests and pkgsinfo, and
+   purges only the metadata paths at the CDN. Packages stay cached.
+4. A message on Service Bus or SQS tells each caching server to pull `git` and
+   sync packages and catalogs from storage.
+5. On each Mac the preflight picks a caching server whose catalog is fresh, or
+   the cloud, and points the Mac at its manifest from inventory.
 
-**AWS Implementation:**
-- Admins commit to a GitHub repo (or AWS CodeCommit) with `manifests/` and `pkgsinfo/`
-- Git hooks run `aws s3 sync` to upload or download packages
-- A pipeline (GitHub Actions or CodePipeline) builds catalogs and updates S3
-- Local caching servers are notified via SQS/SNS
-- A daemon listens for messages and runs `git pull` and syncs assets
-- CloudFront serves files globally or from on-prem caches
+Every pipeline signs in with workload identity federation or OIDC. There is no
+client secret, SAS token or access key to store or rotate; every name in the
+samples is a placeholder.
+
+**Azure:** Blob Storage holds `<container>/deployment/{pkgs,icons,catalogs,manifests,pkgsinfo}`,
+Front Door serves it, Service Bus notifies the caching servers.
+
+**AWS:** S3 holds `<bucket>[/<prefix>]/deployment/...`, CloudFront serves it,
+SQS notifies the caching servers.
+
+The hooks, the pipelines and the listeners all use that same layout.
+
+## makecatalogs and YAML
+
+The pipelines expand a pinned [Munki](https://github.com/munki/munki) release
+and run its `makecatalogs`. Upstream Munki reads plist pkgsinfo only. A repo
+that keeps pkgsinfo in YAML needs a YAML-capable build
+([munki/munki#1261](https://github.com/munki/munki/pull/1261)); point
+`MUNKITOOLS_URL` and `MUNKITOOLS_SHA256` at it. The pipelines say so and fail
+if they meet YAML pkgsinfo with a `makecatalogs` that cannot read it.
+
+## Tests
+
+CI (`.github/workflows/ci.yml`) runs everything offline: the Python tests, the
+hook and preflight tests with fake cloud CLIs, a syntax pass over every script,
+pipeline and plist, and a check that every GitHub Actions `uses:` is pinned to
+a commit and that OIDC is granted only to jobs in a protected environment.
 
 ## Inventory, groups and manifests
 
@@ -130,3 +168,7 @@ The Windows half of this pattern is
 path-to-group rule, same guards, different render targets.
 
 Want to talk shop or ask questions? Connect with me on [BlueSky](https://bsky.app/profile/rodchristiansen.net) or on the [Blog](https://focused.systems).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

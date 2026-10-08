@@ -1,55 +1,133 @@
-name: Munki Deploy (AWS S3 + CloudFront)
+# push-to-production-aws.yml — publish the Munki repo to S3 + CloudFront.
+#
+# GitHub Actions twin of pipelines/azure/push-to-production-aws.yml. Copy it to
+# .github/workflows/ in your Munki repo.
+#
+# Auth is OpenID Connect: configure-aws-credentials assumes an IAM role whose
+# trust policy accepts token.actions.githubusercontent.com with the subject
+# repo:<owner>/<repo>:environment:munki-production. No access keys are stored.
+# The role needs s3:ListBucket, s3:GetObject, s3:PutObject and s3:DeleteObject
+# on the bucket and cloudfront:CreateInvalidation on the distribution.
+
+name: Munki push to production (AWS)
 
 on:
   push:
     branches: [main]
-    paths:   ['deployment/**']
+    paths: ['deployment/**']
+  workflow_dispatch:
+
+# One run at a time, and never cancel one mid-upload.
+concurrency:
+  group: munki-push-production
+  cancel-in-progress: false
+
+# id-token: write is granted only to the job that logs in, in a protected
+# environment; see push-to-production-azure.yml.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+  S3_BUCKET: ${{ vars.S3_BUCKET }}
+  S3_PREFIX: ${{ vars.S3_PREFIX }}                   # optional; empty for the bucket root
+  CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+  MUNKITOOLS_URL: 'https://github.com/munki/munki/releases/download/v7.3.0/munkitools-7.3.0.5808.pkg'
+  MUNKITOOLS_SHA256: '4ed826bd32811ef54524a10300f66c9af4c9fdd8c243ada146d468485e1bffcc'
 
 jobs:
   deploy:
-    runs-on: macos-13
-    env:
-      S3_BUCKET:  ${{ secrets.S3_BUCKET }}
-      DIST_ID:    ${{ secrets.CLOUDFRONT_DIST }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-
+    runs-on: macos-latest
+    environment: munki-production
+    permissions:
+      contents: read
+      id-token: write
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
-      with:
-        sparse-checkout: |
-          deployment
-          pipelines
-        fetch-depth: 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-    - name: Configure AWS creds
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region:            ${{ env.AWS_REGION }}
+      - name: Install pinned makecatalogs
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o munkitools.pkg "$MUNKITOOLS_URL"
+          echo "$MUNKITOOLS_SHA256  munkitools.pkg" | shasum -a 256 -c -
+          pkgutil --expand-full munkitools.pkg munkitools
+          MC="$PWD/$(find munkitools -path '*/usr/local/munki/makecatalogs' -type f | head -1)"
+          [ -f "$MC" ] && [ -x "$MC" ] || { echo "makecatalogs not found in the package"; exit 1; }
+          "$MC" --version
+          echo "MAKECATALOGS=$MC" >> "$GITHUB_ENV"
 
-    - name: Install Munki + deps
-      run: |
-        brew install munki
+      - name: Run makecatalogs
+        run: |
+          set -euo pipefail
+          REPO="$GITHUB_WORKSPACE/deployment"
+          HELD="$(mktemp -d)/managed"
+          restore() { [ -d "$HELD" ] && mv "$HELD" "$REPO/pkgsinfo/apps/managed" || true; }
+          trap restore EXIT
+          [ -d "$REPO/pkgsinfo/apps/managed" ] && mv "$REPO/pkgsinfo/apps/managed" "$HELD"
+          if ! "$MAKECATALOGS" --skip-pkg-check "$REPO"; then
+            if find "$REPO/pkgsinfo" -name '*.yaml' -o -name '*.yml' | grep -q .; then
+              echo "::error::This repo has YAML pkgsinfo; point MUNKITOOLS_URL at a YAML-capable makecatalogs."
+            fi
+            exit 1
+          fi
+          restore; trap - EXIT
+          ls "$REPO/catalogs/all" >/dev/null 2>&1 || { echo "::error::makecatalogs wrote no catalogs"; exit 1; }
+          if grep -R -l -E 'source:[[:space:]]+apple_vpp|<string>apple_vpp</string>' "$REPO/catalogs"; then
+            echo "::error::An Intune managed-app descriptor reached a Munki catalog."
+            exit 1
+          fi
 
-    - name: Build catalogs
-      run: |
-        /usr/local/munki/makecatalogs --skip-pkg-check "${{ github.workspace }}/deployment"
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Clean temp chunks
-      run: |
-        find deployment/pkgs -type f \( -name '*.pkg.*' -o -name '*.dmg.*' \) -delete
+      - name: 'Gate: every pkgsinfo package exists in S3'
+        run: |
+          set -euo pipefail
+          ROOT="${S3_PREFIX:+$S3_PREFIX/}deployment"
+          SRC="$GITHUB_WORKSPACE/deployment"
+          LIST="$RUNNER_TEMP/s3-pkgs.txt"
+          aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$ROOT/pkgs/" \
+            --query 'Contents[].Key' --output text | tr '\t' '\n' | grep -v '^None$' > "$LIST" || true
+          echo "$(wc -l < "$LIST" | tr -d ' ') package object(s) in the bucket"
+          GATE="$(mktemp -d)"
+          mkdir -p "$GATE/pkgs" "$GATE/pkgsinfo"
+          rsync -a --exclude '/apps/managed/' "$SRC/pkgsinfo/" "$GATE/pkgsinfo/"
+          while IFS= read -r key; do
+            rel="${key#$ROOT/pkgs/}"
+            [ -n "$rel" ] && [ "$rel" != "$key" ] || continue
+            case "/$rel/" in */../*) echo "Skipping unsafe key: $key"; continue ;; esac
+            mkdir -p "$(dirname "$GATE/pkgs/$rel")"
+            : > "$GATE/pkgs/$rel"
+          done < "$LIST"
+          LOG="$RUNNER_TEMP/gate.log"
+          "$MAKECATALOGS" "$GATE" > "$LOG" 2>&1 || true
+          if grep -q 'refers to missing installer item:' "$LOG"; then
+            echo "::error::Deploy blocked: pkgsinfo reference packages that are not in S3."
+            grep 'refers to missing installer item:' "$LOG" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "Every referenced package is in S3."
 
-    - name: Sync catalogs to S3
-      run: |
-        aws s3 sync deployment/catalogs  s3://$S3_BUCKET/repo/deployment/catalogs  --delete
+      - name: Sync catalogs, manifests and pkgsinfo
+        run: |
+          set -euo pipefail
+          DEST="s3://$S3_BUCKET/${S3_PREFIX:+$S3_PREFIX/}deployment"
+          SRC="$GITHUB_WORKSPACE/deployment"
+          aws s3 sync "$SRC/catalogs" "$DEST/catalogs" --only-show-errors
+          for d in manifests pkgsinfo; do
+            aws s3 sync "$SRC/$d" "$DEST/$d" --delete --exclude '*.DS_Store' --only-show-errors
+          done
 
-    - name: Sync manifests + pkgsinfo
-      run: |
-        aws s3 sync deployment/manifests s3://$S3_BUCKET/repo/deployment/manifests --delete
-        aws s3 sync deployment/pkgsinfo  s3://$S3_BUCKET/repo/deployment/pkgsinfo  --delete
-
-    - name: Invalidate CloudFront
-      run: |
-        aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*"
+      - name: Invalidate CloudFront (metadata only)
+        run: |
+          set -euo pipefail
+          P="/${S3_PREFIX:+$S3_PREFIX/}deployment"
+          aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "$P/catalogs/*" "$P/manifests/*" "$P/pkgsinfo/*" "$P/icons/*"

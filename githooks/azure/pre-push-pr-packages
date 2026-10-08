@@ -1,0 +1,263 @@
+#!/usr/bin/env zsh
+# HOOK_VERSION=2026.10.07
+#
+# ──────────────────────────────────────────────────────────────────────────────
+#  pre-push-pr-packages  –  branch pushes: make every package a pushed pkgsinfo
+#  needs exist in Azure Blob, create-only.
+#
+#  pre-push runs this for any push that is not main from the primary checkout.
+#  It reads the refs git passes on stdin, finds the pkgsinfo those commits add
+#  or change, and for each one:
+#
+#    • uploads the local package if the blob is absent, with --overwrite=false
+#      and the pkgsinfo's SHA-256 in blob metadata;
+#    • accepts an existing blob only when its SHA-256 metadata matches;
+#    • refuses to replace a package path that holds different bytes. Package
+#      paths are immutable: clients and the CDN cache them forever;
+#    • backfills SHA-256 metadata on a legacy blob only when its identity is
+#      proven, by matching MD5 against the local file or by origin/main
+#      already assigning that hash to that path;
+#    • skips nopkg, profile and apple_update_metadata items and Intune
+#      descriptors under apps/managed, which have no package.
+#
+#  It never deletes anything. Orphan cleanup stays on main.
+#
+#  Config: MUNKI_STORAGE_ACCOUNT, MUNKI_CONTAINER, MUNKI_AZURE_TENANT_ID.
+# ──────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+set -f
+
+BASE="$(git rev-parse --show-toplevel)"
+STORAGE_ACCOUNT="${MUNKI_STORAGE_ACCOUNT:-yourstorageaccount}"
+CONTAINER="${MUNKI_CONTAINER:-munki}"
+STORAGE_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}"
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+changed_file_list=$(mktemp)
+trap 'rm -f "$changed_file_list"' EXIT
+
+collect_changed_pkgsinfo() {
+  local saw_ref=false line local_ref local_sha remote_ref remote_sha base range
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    saw_ref=true
+    read -r local_ref local_sha remote_ref remote_sha <<< "$line"
+    [[ -z "${remote_sha:-}" ]] && {
+      print -u2 "ERROR: Cannot parse pre-push ref: $line"
+      return 1
+    }
+    # Deleting a remote branch pushes no pkgsinfo.
+    [[ "$local_sha" == "$ZERO_SHA" ]] && continue
+
+    if [[ "$remote_sha" == "$ZERO_SHA" ]]; then
+      base=$(git merge-base "$local_sha" origin/main 2>/dev/null) || {
+        print -u2 "ERROR: Cannot determine the branch point from origin/main."
+        return 1
+      }
+      range="$base..$local_sha"
+    else
+      range="$remote_sha..$local_sha"
+    fi
+
+    git diff --diff-filter=ACMR --name-only "$range" -- deployment/pkgsinfo/ \
+      >> "$changed_file_list"
+  done
+
+  [[ "$saw_ref" == false ]] && print -u2 "[pre-push] No refs are being pushed; nothing to validate."
+  return 0
+}
+
+# YAML scalar first, then the plist <key>/<string> pair.
+extract_field() {
+  local key="$1" file="$2" value
+  value=$(grep -E "^${key}:[[:space:]]*" "$file" 2>/dev/null | head -1 \
+    | sed -E "s/^${key}:[[:space:]]*//" | tr -d '"' | tr -d "'" || true)
+  if [[ -z "$value" ]]; then
+    value=$(grep -A1 "<key>${key}</key>" "$file" 2>/dev/null \
+      | grep '<string>' | head -1 \
+      | sed -E 's#.*<string>(.*)</string>.*#\1#' || true)
+  fi
+  print -r -- "$value"
+}
+
+# A location becomes a local path and a blob name, so it must stay under
+# deployment/pkgs: no absolute path, no empty or .. segment, no control
+# characters. Prints the normalised relative path.
+normalise_location() {
+  local loc="$1" seg
+  loc="${loc#deployment/pkgs/}"
+  loc="${loc#pkgs/}"
+  [[ -n "$loc" && "$loc" != /* && "$loc" != *[[:cntrl:]]* && "$loc" != *\\* ]] || return 1
+  for seg in "${(@s:/:)loc}"; do
+    [[ -n "$seg" && "$seg" != "." && "$seg" != ".." ]] || return 1
+  done
+  print -r -- "$loc"
+}
+
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  fi
+}
+
+local_md5_base64() {
+  openssl dgst -md5 -binary "$1" | base64 | tr -d '\n'
+}
+
+# 0 exists, 1 absent, 2 could not tell.
+blob_exists() {
+  local exists
+  exists=$(az storage blob exists --account-name "$STORAGE_ACCOUNT" \
+    --container-name "$CONTAINER" --name "$1" --auth-mode login \
+    --query exists -o tsv --only-show-errors 2>/dev/null) || return 2
+  [[ "$exists" == "true" ]]
+}
+
+blob_property() {
+  az storage blob show --account-name "$STORAGE_ACCOUNT" \
+    --container-name "$CONTAINER" --name "$1" --auth-mode login \
+    --query "$2" -o tsv --only-show-errors 2>/dev/null || return 2
+}
+
+backfill_sha256_metadata() {
+  az storage blob metadata update --account-name "$STORAGE_ACCOUNT" \
+    --container-name "$CONTAINER" --name "$1" --auth-mode login \
+    --metadata "sha256=$2" --if-match "$3" --only-show-errors >/dev/null
+}
+
+# The SHA-256 origin/main assigns to a package path, "conflict" if two
+# pkgsinfo on main disagree, or nothing.
+main_sha256_for_location() {
+  local wanted="$1" candidate temp loc hash found=""
+  local -a candidates
+  candidates=("${(@f)$(git grep -l -F -- "$wanted" origin/main -- deployment/pkgsinfo/ 2>/dev/null || true)}")
+  for candidate in "${candidates[@]}"; do
+    [[ -z "$candidate" ]] && continue
+    temp=$(mktemp)
+    if ! git show "$candidate" > "$temp" 2>/dev/null; then rm -f "$temp"; continue; fi
+    loc=$(normalise_location "$(extract_field installer_item_location "$temp")" || true)
+    hash=$(extract_field installer_item_hash "$temp"); hash="${hash:l}"
+    rm -f "$temp"
+    [[ "$loc" == "$wanted" && ${#hash} -eq 64 ]] || continue
+    if [[ -n "$found" && "$found" != "$hash" ]]; then print -r -- conflict; return 0; fi
+    found="$hash"
+  done
+  print -r -- "$found"
+}
+
+collect_changed_pkgsinfo
+sort -u "$changed_file_list" -o "$changed_file_list"
+[[ ! -s "$changed_file_list" ]] && exit 0
+
+command -v az >/dev/null 2>&1 || {
+  print -u2 "ERROR: Azure CLI is required to verify the packages this push references."
+  exit 1
+}
+az account get-access-token --resource https://storage.azure.com --output none 2>/dev/null || {
+  print -u2 "ERROR: Azure sign-in is required to verify the packages this push references."
+  print -u2 "Run: az login${MUNKI_AZURE_TENANT_ID:+ --tenant $MUNKI_AZURE_TENANT_ID}"
+  exit 1
+}
+export AZCOPY_AUTO_LOGIN_TYPE="AZCLI"
+
+failures=0
+fail() { print -u2 "ERROR: $1"; failures=$(( failures + 1 )); }
+
+while IFS= read -r pkgsinfo; do
+  [[ -f "$BASE/$pkgsinfo" ]] || continue
+  [[ "$pkgsinfo" == deployment/pkgsinfo/apps/managed/* ]] && continue
+  case "$(extract_field installer_type "$BASE/$pkgsinfo")" in
+    nopkg|profile|apple_update_metadata) continue ;;
+  esac
+
+  raw_location=$(extract_field installer_item_location "$BASE/$pkgsinfo")
+  [[ -n "$raw_location" ]] || { fail "$pkgsinfo has no installer_item_location."; continue; }
+  location=$(normalise_location "${raw_location#/}") || { fail "$pkgsinfo has an unsafe installer_item_location: $raw_location"; continue; }
+
+  expected_hash=$(extract_field installer_item_hash "$BASE/$pkgsinfo"); expected_hash="${expected_hash:l}"
+  if [[ ${#expected_hash} -ne 64 || "$expected_hash" == *[^0-9a-f]* ]]; then
+    fail "$pkgsinfo has no valid SHA-256 installer_item_hash."
+    continue
+  fi
+
+  local_path="$BASE/deployment/pkgs/$location"
+  blob_path="deployment/pkgs/$location"
+
+  exists_status=0
+  blob_exists "$blob_path" || exists_status=$?
+  if (( exists_status == 2 )); then fail "Could not check Azure for $blob_path."; continue; fi
+
+  if (( exists_status == 0 )); then
+    remote_hash=$(blob_property "$blob_path" metadata.sha256) || { fail "Could not read SHA-256 metadata for $blob_path."; continue; }
+    remote_hash="${remote_hash:l}"
+    if [[ "$remote_hash" == "$expected_hash" ]]; then
+      print "[pre-push] Package already in Azure: $location"
+      continue
+    fi
+    if [[ -n "$remote_hash" ]]; then
+      fail "Refusing to replace immutable package path $location (Azure $remote_hash, pkgsinfo $expected_hash)."
+      continue
+    fi
+
+    # A legacy blob with no SHA-256 metadata. Backfill only on proof.
+    main_hash=$(main_sha256_for_location "$location")
+    if [[ "$main_hash" == conflict || ( -n "$main_hash" && "$main_hash" != "$expected_hash" ) ]]; then
+      fail "origin/main assigns a different SHA-256 to $location."
+      continue
+    fi
+    proven=false
+    [[ "$main_hash" == "$expected_hash" ]] && proven=true
+    if [[ "$proven" == false && -f "$local_path" ]] && [[ "$(sha256_of "$local_path")" == "$expected_hash" ]]; then
+      remote_md5=$(blob_property "$blob_path" properties.contentSettings.contentMd5 || true)
+      [[ -n "$remote_md5" && "$remote_md5" == "$(local_md5_base64 "$local_path")" ]] && proven=true
+    fi
+    if [[ "$proven" == false ]]; then
+      fail "Blob $location has no SHA-256 identity and nothing proves it matches $pkgsinfo."
+      continue
+    fi
+    etag=$(blob_property "$blob_path" properties.etag || true)
+    if [[ -n "$etag" ]] && backfill_sha256_metadata "$blob_path" "$expected_hash" "$etag"; then
+      print "[pre-push] Recorded SHA-256 on legacy blob: $location"
+    elif [[ "$(blob_property "$blob_path" metadata.sha256 || true)" == "$expected_hash" ]]; then
+      print "[pre-push] Another checkout recorded the same SHA-256: $location"
+    else
+      fail "Blob $location changed while its identity was being recorded."
+    fi
+    continue
+  fi
+
+  # Absent from Azure: upload it, if we have it and it is the right file.
+  if [[ ! -f "$local_path" ]]; then
+    fail "$pkgsinfo references a package absent locally and in Azure: deployment/pkgs/$location"
+    continue
+  fi
+  if [[ "$(sha256_of "$local_path")" != "$expected_hash" ]]; then
+    fail "SHA-256 of deployment/pkgs/$location does not match $pkgsinfo."
+    continue
+  fi
+  command -v azcopy >/dev/null 2>&1 || { fail "azcopy is required to upload $location."; continue; }
+
+  print "[pre-push] Uploading package for $pkgsinfo: $location"
+  if azcopy copy "$local_path" "$STORAGE_URL/$blob_path" \
+      --put-md5 --overwrite=false --metadata="sha256=$expected_hash" \
+      --log-level=ERROR --output-level=essential; then
+    az storage blob update --account-name "$STORAGE_ACCOUNT" \
+      --container-name "$CONTAINER" --name "$blob_path" --auth-mode login \
+      --content-cache-control "public, max-age=31536000, immutable" \
+      --only-show-errors >/dev/null || print -u2 "WARNING: could not set Cache-Control on $location"
+  elif [[ "$(blob_property "$blob_path" metadata.sha256 || true)" == "$expected_hash" ]]; then
+    # Another checkout won the create-only race with the same bytes.
+    print "[pre-push] Another checkout uploaded the same package: $location"
+  else
+    fail "Upload of $location failed or collided with different bytes."
+  fi
+done < "$changed_file_list"
+
+if (( failures > 0 )); then
+  print -u2 "[pre-push] Push blocked: $failures package reference(s) unresolved."
+  exit 1
+fi
+print "[pre-push] Every package this push references is in Azure."

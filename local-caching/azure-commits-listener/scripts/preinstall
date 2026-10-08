@@ -1,2 +1,5 @@
 #!/bin/zsh
-launchctl unload /Library/LaunchDaemons/com.domain.CommitsListener.plist
+# Stop the running listener before its files are replaced. bootout fails when
+# the job is not loaded, which is the normal first-install case.
+/bin/launchctl bootout system/com.domain.CommitsListener 2>/dev/null || true
+exit 0

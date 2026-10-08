@@ -1,0 +1,331 @@
+#!/bin/zsh
+# PREFLIGHT_VERSION=2026.10.07
+#
+# Munki preflight: pick the repo, look this Mac up in inventory, and point it
+# at the manifest inventory says it should read.
+#
+#   1. Repository   - the first local mirror whose catalog is fresh, else the
+#                     cloud repo. A mirror whose sync has died still answers 200
+#                     for old files, so reachability alone is not enough.
+#   2. Inventory    - downloads deployment/enroll/computers.csv (published by
+#                     enrollment/consumers/munki.py) from that same source, finds
+#                     this serial, and writes /Library/Management/Inventory.yaml.
+#   3. Identity     - ComputerName, HostName and LocalHostName from the row,
+#                     plus the Remote Desktop info fields.
+#   4. Manifest     - ClientIdentifier = usage/catalog/area/location/hostname,
+#                     the per-device manifest under the same tree the Entra
+#                     group ladder is built from.
+#
+# Munki runs this as root before every run and aborts the run if it exits
+# non-zero, so every failure below logs and exits 0: a broken inventory lookup
+# must never stop software from installing.
+#
+# Manual override, for a device a provisioning re-run knocked back onto a
+# provisioning manifest:
+#   sudo /usr/local/munki/preflight --force
+#   sudo touch /Library/Management/.force_production_enrollment   (one-shot)
+
+# Never trace: the request headers below carry the repo credential.
+set +x
+setopt NO_XTRACE
+PS4=''
+
+# ── Configuration ────────────────────────────────────────────────────────────
+# Everything an organisation changes lives here.
+
+# Local caching servers, in order of preference, and the cloud fallback. Each
+# mirror serves the repo at http://<host>/deployment.
+MIRROR_HOSTS=(mirror1.example.org mirror2.example.org)
+MIRROR_SCHEME="http"
+CLOUD_REPO_URL="https://munki.example.org/deployment"
+
+# What the freshness probe fetches, and how old it may be.
+MIRROR_TEST_PATH="catalogs/Production.yaml"
+MIRROR_MAX_AGE_SECS=$(( 48 * 3600 ))
+
+# Where the inventory projection lives inside the repo.
+INVENTORY_CSV_PATH="enroll/computers.csv"
+
+# Manifests a device sits on while it is still being provisioned. Preflight
+# does not move a device off one of these; the provisioning tool does.
+PROVISIONING_MANIFESTS=(Bootstrap Provisioning)
+
+# Inventory statuses that mean the device is leaving the fleet, and the
+# manifest that removes management from it. Keep the list in step with
+# RETIRE_STATUSES in enrollment/shared/hierarchy.py.
+RETIRE_STATUSES=(Retired Lost Stolen "Returned Lease End" Disposed)
+DECOMMISSION_MANIFEST="Decommission"
+
+# Clients behind a CDN that answers with a redirect to signed blob URLs need
+# Munki to follow HTTPS redirects.
+FOLLOW_HTTPS_REDIRECTS=true
+
+PREFS="/Library/Preferences/ManagedInstalls"
+SECURE_PREFS="/var/root/Library/Preferences/ManagedInstalls.plist"
+INVENTORY_YAML="/Library/Management/Inventory.yaml"
+FORCE_ENROLL_FLAG="/Library/Management/.force_production_enrollment"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+log_info()  { print -u2 -r -- "$1"; }
+log_detail(){ print -u2 -r -- "  $1"; }
+log_warn()  { print -u2 -r -- "WARNING: $1"; }
+log_error() { print -u2 -r -- "ERROR: $1"; }
+log_debug() { [[ -n "${MUNKI_PREFLIGHT_DEBUG:-}" ]] && print -u2 -r -- "DEBUG: $1"; return 0; }
+
+in_list() {
+  local needle="$1"; shift
+  local item
+  for item in "$@"; do [[ "$item" == "$needle" ]] && return 0; done
+  return 1
+}
+
+# ── Request headers ──────────────────────────────────────────────────────────
+# Reuse whatever AdditionalHttpHeaders Munki itself sends (usually a Basic or
+# Bearer Authorization header). They go to curl through a 0600 config file,
+# never on its command line, where any local user could read them from ps.
+CURL_CONFIG=$(mktemp -t munki-preflight)
+chmod 600 "$CURL_CONFIG"
+trap 'rm -f "$CURL_CONFIG"' EXIT
+
+load_request_headers() {
+  local plist i header
+  for plist in "$SECURE_PREFS" "$PREFS.plist"; do
+    [[ -f "$plist" ]] || continue
+    i=0
+    while header=$(plutil -extract "AdditionalHttpHeaders.$i" raw -o - "$plist" 2>/dev/null); do
+      # curl config syntax: escape backslashes and double quotes.
+      header=${header//\\/\\\\}
+      header=${header//\"/\\\"}
+      print -r -- "header = \"$header\"" >> "$CURL_CONFIG"
+      i=$(( i + 1 ))
+    done
+    (( i > 0 )) && { log_debug "Loaded $i request header(s) from $plist"; return 0; }
+  done
+  log_debug "No AdditionalHttpHeaders configured; requests go unauthenticated"
+}
+
+# ── Repository selection ─────────────────────────────────────────────────────
+# mirror_is_fresh <base-url>: the test catalog answers 200 and was modified
+# within MIRROR_MAX_AGE_SECS.
+mirror_is_fresh() {
+  local base="$1" headers http_status lastmod lm_epoch now_epoch
+  headers=$(curl -K "$CURL_CONFIG" -Is -m 3 "$base/$MIRROR_TEST_PATH" 2>/dev/null) || return 1
+  http_status=$(print -r -- "$headers" | head -1 | awk '{print $2}')
+  [[ "$http_status" == "200" ]] || { log_detail "$base: catalog probe returned HTTP ${http_status:-none}"; return 1; }
+  lastmod=$(print -r -- "$headers" | awk -F': ' 'tolower($1)=="last-modified"{print $2}' | tr -d '\r')
+  [[ -n "$lastmod" ]] || { log_detail "$base: catalog has no Last-Modified header"; return 1; }
+  lm_epoch=$(LC_ALL=C date -j -f "%a, %d %b %Y %T %Z" "$lastmod" +%s 2>/dev/null) || {
+    log_detail "$base: unparseable Last-Modified '$lastmod'"; return 1; }
+  now_epoch=$(date +%s)
+  if (( now_epoch - lm_epoch > MIRROR_MAX_AGE_SECS )); then
+    log_detail "$base: catalog is $(( (now_epoch - lm_epoch) / 3600 ))h old, mirror is stale"
+    return 1
+  fi
+  return 0
+}
+
+# Sets REPO_URL to the first fresh mirror, else the cloud repo, and writes it
+# to SoftwareRepoURL.
+REPO_URL=""
+configure_repository() {
+  local host base
+  log_info "Selecting the Munki repository..."
+  for host in "${MIRROR_HOSTS[@]}"; do
+    base="$MIRROR_SCHEME://$host/deployment"
+    if mirror_is_fresh "$base"; then
+      REPO_URL="$base"
+      break
+    fi
+  done
+  [[ -n "$REPO_URL" ]] || { REPO_URL="$CLOUD_REPO_URL"; log_detail "No fresh local mirror; using the cloud repo"; }
+
+  if [[ "$(defaults read "$PREFS" SoftwareRepoURL 2>/dev/null)" != "$REPO_URL" ]]; then
+    defaults write "$PREFS" SoftwareRepoURL "$REPO_URL" || { log_error "Could not set SoftwareRepoURL"; return 1; }
+  fi
+  log_detail "SoftwareRepoURL: $REPO_URL"
+}
+
+# ── Inventory ────────────────────────────────────────────────────────────────
+typeset -A ROW
+
+# fetch_inventory_row <serial>: fills ROW from the CSV row for this serial.
+# Columns are found by header name, so the projection may reorder them. Fields
+# must not contain commas; the projection never writes one.
+fetch_inventory_row() {
+  local serial="$1" csv http_status curl_rc header row i
+  local -a names values
+  csv=$(mktemp -t munki-inventory)
+
+  # Fetch from the repo selected above: a stale mirror's CSV would re-enrol
+  # this Mac under whoever owned the serial months ago.
+  http_status=$(curl -K "$CURL_CONFIG" -s -w '%{http_code}' -o "$csv" -m 20 "$REPO_URL/$INVENTORY_CSV_PATH")
+  curl_rc=$?
+  # A transfer cut off by the timeout still reports 200 and leaves a truncated
+  # file, and a serial missing from the cut-off tail reads as "not enrolled".
+  # Only curl exit 0 and HTTP 200 together count as a download.
+  if [[ $curl_rc -ne 0 || "$http_status" != "200" ]]; then
+    log_error "Inventory download failed from $REPO_URL (HTTP ${http_status:-none}, curl exit $curl_rc)"
+    [[ "$http_status" == "401" || "$http_status" == "403" ]] && log_error "Check AdditionalHttpHeaders in ManagedInstalls"
+    rm -f "$csv"; return 1
+  fi
+
+  header=$(head -1 "$csv" | tr -d '\r"')
+  row=$(grep -m1 -E "^\"?${serial}\"?," "$csv" | tr -d '\r')
+  rm -f "$csv"
+  [[ -n "$header" && -n "$row" ]] || { log_warn "Serial $serial is not in inventory"; return 1; }
+
+  names=("${(@s:,:)header}")
+  values=("${(@s:,:)row}")
+  ROW=()
+  for (( i = 1; i <= ${#names}; i++ )); do
+    local v="${values[i]:-}"
+    v="${v#\"}"; v="${v%\"}"
+    v="${v##[[:space:]]#}"; v="${v%%[[:space:]]#}"
+    ROW[${names[i]}]="$v"
+  done
+  [[ "${ROW[serial]:-}" == "$serial" ]] || { log_warn "Inventory row for $serial did not parse"; return 1; }
+}
+
+write_inventory_yaml() {
+  mkdir -p "${INVENTORY_YAML:h}" || return 1
+  local tmp="$INVENTORY_YAML.tmp" key
+  {
+    print -- "---"
+    print -- "# Written by the Munki preflight from inventory. Do not edit."
+    for key in serial asset status allocation hostname username usage catalog area location fleet; do
+      print -r -- "$key: ${ROW[$key]:-}"
+    done
+  } > "$tmp" && chmod 644 "$tmp" && mv "$tmp" "$INVENTORY_YAML"
+}
+
+read_inventory_yaml() {
+  [[ -f "$INVENTORY_YAML" ]] || return 1
+  awk -F': ' -v key="$1" '$1 == key {print $2; exit}' "$INVENTORY_YAML"
+}
+
+# LocalHostName accepts only letters, digits and hyphens.
+clean_hostname() {
+  print -r -- "$1" | sed 's/([0-9]*)$//' | tr -cd 'A-Za-z0-9-'
+}
+
+apply_identity() {
+  local hostname
+  hostname=$(clean_hostname "${ROW[hostname]:-${ROW[allocation]// /}}")
+  [[ -n "$hostname" ]] || { log_warn "Inventory row has no hostname"; return 1; }
+  ROW[hostname]="$hostname"
+
+  /usr/sbin/scutil --set ComputerName "${ROW[allocation]:-$hostname}"
+  /usr/sbin/scutil --set HostName "$hostname"
+  /usr/sbin/scutil --set LocalHostName "$hostname"
+  log_detail "Names set to $hostname"
+
+  local ard="/Library/Preferences/com.apple.RemoteDesktop"
+  defaults write "$ard" Text1 -string "${ROW[catalog]:-}"
+  defaults write "$ard" Text2 -string "${ROW[area]:-}"
+  defaults write "$ard" Text3 -string "${ROW[location]:-}"
+  defaults write "$ard" Text4 -string "${ROW[asset]:-}"
+  defaults write "$ard" Text5 -string "${ROW[usage]:-}"
+  defaults write "$ard" Text6 -string "${ROW[username]:-}"
+  defaults write "$ard" Text7 -string "${ROW[status]:-}"
+}
+
+# ── Manifest ─────────────────────────────────────────────────────────────────
+set_client_identifier() {
+  local wanted="$1" current
+  current=$(defaults read "$PREFS" ClientIdentifier 2>/dev/null || true)
+  if [[ "${current%.(yaml|plist|xml)}" == "$wanted" ]]; then
+    log_detail "ClientIdentifier already $wanted"
+    return 0
+  fi
+  defaults write "$PREFS" ClientIdentifier -string "$wanted" || { log_error "Could not set ClientIdentifier"; return 1; }
+  log_info "ClientIdentifier: '${current:-unset}' -> '$wanted'"
+}
+
+# usage/catalog/area/location/hostname, dropping an empty location. The parent
+# of this path is the area manifest the Entra group ladder mirrors.
+derive_client_identifier() {
+  local -a parts
+  local key
+  for key in usage catalog area location hostname; do
+    [[ -n "${ROW[$key]:-}" ]] && parts+=("${ROW[$key]// /}")
+  done
+  if [[ -z "${ROW[usage]:-}" || -z "${ROW[catalog]:-}" || -z "${ROW[area]:-}" || -z "${ROW[hostname]:-}" ]]; then
+    return 1
+  fi
+  print -r -- "${(j:/:)parts}"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+main() {
+  local force=false arg current status serial cid
+  [[ -n "${MUNKI_PREFLIGHT_FORCE_ENROLL:-}" || -f "$FORCE_ENROLL_FLAG" ]] && force=true
+  # Munki passes its run type ("auto", "manualcheck", ...) as $1, so this scan
+  # is additive.
+  for arg in "$@"; do [[ "$arg" == (--force|-f) ]] && force=true; done
+
+  if [[ $EUID -ne 0 ]]; then
+    log_error "Run as root (Munki does)."
+    return 0
+  fi
+
+  if [[ "$FOLLOW_HTTPS_REDIRECTS" == true && "$(defaults read "$PREFS" FollowHTTPRedirects 2>/dev/null)" != "https" ]]; then
+    defaults write "$PREFS" FollowHTTPRedirects -string https
+  fi
+
+  load_request_headers
+  configure_repository || log_warn "Repository selection failed; keeping the current SoftwareRepoURL"
+  [[ -n "$REPO_URL" ]] || REPO_URL=$(defaults read "$PREFS" SoftwareRepoURL 2>/dev/null || print -r -- "$CLOUD_REPO_URL")
+
+  current=$(defaults read "$PREFS" ClientIdentifier 2>/dev/null || true)
+  log_info "Current ClientIdentifier: '${current:-unset}'"
+  if in_list "$current" "${PROVISIONING_MANIFESTS[@]}"; then
+    if [[ "$force" != true ]]; then
+      log_info "Device is provisioning on '$current'; leaving the manifest alone"
+      return 0
+    fi
+    log_warn "Provisioning manifest '$current' overridden by --force"
+  fi
+
+  serial=$(/usr/sbin/ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformSerialNumber/{print $4}')
+  [[ -n "$serial" ]] || { log_error "Could not read the serial number"; return 0; }
+  log_info "Serial number: $serial"
+
+  if fetch_inventory_row "$serial"; then
+    write_inventory_yaml || log_warn "Could not write $INVENTORY_YAML"
+    status="${ROW[status]:-}"
+  else
+    # No fresh row: act on what the last good lookup recorded, so a device
+    # marked retired stays retired while the inventory is unreachable.
+    status=$(read_inventory_yaml status || true)
+    if in_list "$status" "${RETIRE_STATUSES[@]}"; then
+      set_client_identifier "$DECOMMISSION_MANIFEST"
+    fi
+    return 0
+  fi
+
+  if in_list "$status" "${RETIRE_STATUSES[@]}"; then
+    log_warn "Inventory status is '$status'; moving to the $DECOMMISSION_MANIFEST manifest"
+    set_client_identifier "$DECOMMISSION_MANIFEST"
+    return 0
+  fi
+
+  apply_identity || { log_warn "Could not apply the inventory identity"; return 0; }
+
+  if cid=$(derive_client_identifier); then
+    set_client_identifier "$cid" || return 0
+  else
+    log_warn "Inventory row lacks usage, catalog, area or hostname; ClientIdentifier unchanged"
+    return 0
+  fi
+
+  if [[ "$force" == true && -f "$FORCE_ENROLL_FLAG" ]]; then
+    rm -f "$FORCE_ENROLL_FLAG"
+    log_info "Cleared the one-shot force-enrolment flag"
+  fi
+}
+
+# Tests source this file for its functions without running it.
+[[ -n "${MUNKI_PREFLIGHT_SOURCE_ONLY:-}" ]] && return 0
+
+main "$@"
+exit 0

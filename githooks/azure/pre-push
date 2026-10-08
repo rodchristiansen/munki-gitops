@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.22
+# HOOK_VERSION=2026.10.07
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-push hook  –  safe Azure Blob upload for Munki repo
 #
-#  • Gated to pushing `main` — other branches push freely, no sync.
+#  • Branch pushes run pre-push-pr-packages: every package the pushed
+#    pkgsinfo reference must be in Azure Blob or is uploaded now, create-only.
+#  • Pushing main gets the full path below.
 #  • Aborts when behind origin/main (unless fast-forward succeeds).
 #  • Re-runs makecatalogs as a final pre-flight.
 #  • Every `azcopy sync` writes MD5 to blob metadata (--put-md5) so future
 #    --compare-hash=MD5 runs have something to compare against — without it,
 #    hash compares are meaningless and files re-transfer every time.
-#  • Azure orphan cleanup after successful sync (capped, deployment-validated).
+#  • Uploads are additive; nothing is deleted from a partial local cache.
+#  • Azure orphan cleanup after successful sync (capped, deployment-validated,
+#    packages referenced on any remote branch kept).
 #  • Symlink-crossing guard refuses delete-syncs that would traverse into the
 #    primary worktree's cache.
 #
@@ -24,7 +28,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "pre-push" "2026.04.22"
+check_hook_version "pre-push" "2026.10.07"
 should_skip_hook "pre-push" && exit 0
 link_worktree_sync_caches
 acquire_hook_lock "pre-push" || exit 1
@@ -179,6 +183,14 @@ cleanup_azure_orphans() {
     return 0
   fi
 
+  # Keep packages that open branches reference: pre-push-pr-packages uploaded
+  # them before the branch merged.
+  local branch_file; branch_file=$(mktemp)
+  remote_branch_pkg_locations > "$branch_file" || true
+  sort -u "$canonical_file" "$branch_file" -o "$canonical_file"
+  log "  $(wc -l < "$branch_file" | tr -d ' ') package reference(s) across remote branches kept"
+  rm -f "$branch_file"
+
   local azure_list; azure_list=$(mktemp)
   "$AZCOPY" list "$STORAGE_URL/deployment/pkgs/" 2>/dev/null | \
     grep -v '^INFO:' | \
@@ -281,12 +293,17 @@ if [[ ${#TARGET_PATHS[@]} -gt 0 ]]; then
   exit 0
 fi
 
-# ── branch gating ──────────────────────────────────────────
+# ── branch gate ────────────────────────────────────────────
+# A branch push gets the narrow, additive path: every package its pkgsinfo
+# reference must already be in storage or be uploaded now, create-only.
+# Catalog checks, full syncs and orphan deletion stay on main.
 current_branch=$(git symbolic-ref --quiet --short HEAD || true)
 if [[ "$current_branch" != "main" && "$current_branch" != "master" ]]; then
-  log "Skipping upload — branch '$current_branch' is not main/master."
+  log "Branch '$current_branch' — checking the packages its pkgsinfo reference"
+  pr_status=0
+  "$HOOK_DIR/pre-push-pr-packages" 2>&1 | tee -a "$LOGFILE" || pr_status=$?
   mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
-  exit 0
+  exit "$pr_status"
 fi
 
 # ── fast-forward guard ─────────────────────────────────────
@@ -377,10 +394,13 @@ if ! assert_safe_delete_sync "$REPO_ROOT/deployment/pkgs" "pre-push upload sync"
   exit 1
 fi
 
+# Uploads are additive: a sync never deletes, because a checkout missing part
+# of the package cache would otherwise delete those packages from storage.
+# Removal is cleanup_azure_orphans' job, against committed pkgsinfo, capped.
 # Common flags — --put-md5 is REQUIRED. Without it, future syncs can't
 # compare hashes and re-transfer every file every time.
 AZCOPY_SYNC_FLAGS=(
-  --delete-destination=true
+  --delete-destination=false
   --exclude-pattern="*.DS_Store"
   --put-md5
   --compare-hash=MD5

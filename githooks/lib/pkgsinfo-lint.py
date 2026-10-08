@@ -2,10 +2,11 @@
 """
 pkgsinfo-lint.py  —  static pkgsinfo structural validation for Munki pre-commit.
 
-Schema derived from Munki source, not copied from Cimian. Key source locations:
-    packages/MunkiTools/code/cli/munki/shared/utils/yamlutils.swift
-    packages/MunkiTools/code/cli/munki/shared/installer/installer.swift
-    packages/MunkiTools/code/cli/munki/shared/admin/pkginfoOptions.swift
+Schema derived from Munki source, not copied from Cimian. Key source locations
+in munki/munki (yamlutils.swift is in the YAML-support branch, munki/munki#1261):
+    code/cli/munki/shared/utils/yamlutils.swift
+    code/cli/munki/shared/installer/installer.swift
+    code/cli/munki/shared/admin/pkginfoOptions.swift
 
 Usage:
     pkgsinfo-lint.py <repo-root>
@@ -113,6 +114,72 @@ VALID_RESTART_ACTIONS: set[str] = {
     "None", "RequireRestart", "RecommendRestart", "RequireLogout",
 }
 
+# Intune VPP descriptors live under pkgsinfo/apps/managed/. They sit beside
+# pkginfo but are not pkginfo: the push pipeline hides that directory from
+# makecatalogs, and these rules replace the pkginfo schema for it.
+MANAGED_APP_KEYS: set[str] = {
+    "name", "category", "source", "store_id", "bundle_id",
+    "alternate_bundle_ids", "aliases", "assignment", "catalogs",
+}
+
+RELEASE_RINGS: list[str] = ["Development", "Testing", "Staging", "Production"]
+
+# Optional closed vocabulary for the managed-app `category` field, as a
+# comma-separated list. Unset, any category (or none) is accepted.
+MANAGED_APP_CATEGORIES: set[str] = {
+    c.strip() for c in os.environ.get("MUNKI_MANAGED_APP_CATEGORIES", "").split(",") if c.strip()
+}
+
+
+def is_managed_app_path(path: Path) -> bool:
+    return path.parent.name == "managed" and path.parent.parent.name == "apps"
+
+
+def _managed_app_issues(data: dict[str, Any]) -> list[str]:
+    """Validate Intune app metadata stored beside, but excluded from, pkginfo."""
+    errors: list[str] = []
+
+    for key in sorted(set(data) - MANAGED_APP_KEYS):
+        errors.append(f"Unknown managed-app key '{key}'")
+
+    for required in ("name", "source", "store_id", "bundle_id", "assignment", "catalogs"):
+        if data.get(required) in (None, ""):
+            errors.append(f"Missing required managed-app field '{required}'")
+
+    if data.get("source") != "apple_vpp":
+        errors.append("Field 'source' must be 'apple_vpp'")
+
+    if MANAGED_APP_CATEGORIES and data.get("category") not in MANAGED_APP_CATEGORIES:
+        errors.append("Field 'category' is not in MUNKI_MANAGED_APP_CATEGORIES")
+
+    if not isinstance(data.get("store_id"), str):
+        errors.append("Field 'store_id' must be a quoted string (a bare number loses leading zeros)")
+
+    catalogs = data.get("catalogs")
+    if not isinstance(catalogs, list) or not catalogs:
+        errors.append("Field 'catalogs' must be a non-empty list")
+    elif catalogs != RELEASE_RINGS[:len(catalogs)]:
+        errors.append("Field 'catalogs' must be a cumulative release-ring prefix "
+                      f"of {RELEASE_RINGS}")
+
+    assignment = data.get("assignment")
+    if not isinstance(assignment, dict):
+        errors.append("Field 'assignment' must be a mapping")
+    else:
+        for key in sorted(set(assignment) - {"intent", "device_licensing", "prevent_auto_update"}):
+            errors.append(f"Unknown assignment key '{key}'")
+        if assignment.get("intent") not in {"available", "required"}:
+            errors.append("assignment.intent must be 'available' or 'required'")
+        for key in ("device_licensing", "prevent_auto_update"):
+            if not isinstance(assignment.get(key), bool):
+                errors.append(f"assignment.{key} must be boolean")
+
+    for key in ("alternate_bundle_ids", "aliases"):
+        if key in data and not isinstance(data.get(key), list):
+            errors.append(f"Field '{key}' must be a list")
+
+    return errors
+
 
 def issues_for_file(path: Path) -> list[str]:
     """Validate one pkgsinfo file. Returns a list of error strings."""
@@ -140,12 +207,18 @@ def issues_for_file(path: Path) -> list[str]:
             except Exception:
                 data = yaml.safe_load(raw_bytes)
     except Exception as exc:
+        if is_managed_app_path(path):
+            return [f"Managed-app metadata could not be parsed: {exc}"]
         # makecatalogs already blocks on parse errors with better messages;
         # don't duplicate here. Return empty so the commit path gets to it.
         return []
 
     if not isinstance(data, dict):
         errors.append("Top-level structure is not a mapping/dict")
+        return errors
+
+    if is_managed_app_path(path):
+        errors.extend(_managed_app_issues(data))
         return errors
 
     top_keys = set(data.keys())
@@ -233,8 +306,10 @@ def issues_for_file(path: Path) -> list[str]:
     # 8. nopkg install loop trap
     # nopkg runs install_script/postinstall_script every managedsoftwareupdate
     # cycle unless installcheck_script or `installs` tells Munki it's already
-    # done. Block commits that would create the loop.
-    if installer_type == "nopkg":
+    # done. Block commits that would create the loop. OnDemand items are exempt:
+    # Munki only runs them when the user triggers them from Managed Software
+    # Center, so there is no per-cycle loop to guard against.
+    if installer_type == "nopkg" and not data.get("OnDemand"):
         has_install_script = any(
             k in data for k in ("postinstall_script", "preinstall_script", "install_script")
         )

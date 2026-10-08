@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# HOOK_VERSION=2026.04.19
+# HOOK_VERSION=2026.10.07
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-push hook  –  safe AWS S3 upload for Munki repo
 #
-#  • Gated to pushing main/master — other branches push freely, no sync.
+#  • Branch pushes run pre-push-pr-packages: every package the pushed
+#    pkgsinfo reference must be in S3 or is uploaded now, create-only.
+#  • Pushing main gets the full path below.
 #  • Aborts when behind origin (unless fast-forward succeeds).
 #  • Re-runs makecatalogs as a final pre-flight.
-#  • `aws s3 sync --delete` removes S3 objects not present locally.
-#  • S3 orphan cleanup vs committed pkgsinfo after successful sync.
+#  • Uploads are additive; nothing is deleted from a partial local cache.
+#  • S3 orphan cleanup after a successful sync (floor, cap, and packages
+#    referenced on any remote branch kept).
 #
 #  Env bypass: GIT_NO_VERIFY, SKIP_MUNKI_HOOKS, SKIP_PRE_PUSH, DISABLE_CUSTOM_HOOKS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -20,7 +23,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$HOOK_DIR/../lib/common.sh"
 
-check_hook_version "pre-push" "2026.04.19"
+check_hook_version "pre-push" "2026.10.07"
 should_skip_hook "pre-push" && exit 0
 link_worktree_sync_caches
 acquire_hook_lock "pre-push" || exit 1
@@ -34,6 +37,7 @@ S3_BUCKET="${MUNKI_S3_BUCKET:-your-munki-bucket}"
 S3_PREFIX="${MUNKI_S3_PREFIX:-}"
 AWS_REGION="${MUNKI_AWS_REGION:-${AWS_REGION:-us-east-1}}"
 S3_URL="s3://${S3_BUCKET}${S3_PREFIX:+/$S3_PREFIX}"
+S3_ORPHAN_DELETION_CAP="${MUNKI_S3_ORPHAN_DELETION_CAP:-50}"
 
 if ! command -v aws &>/dev/null; then
   echo "ERROR: aws CLI not found — install with: brew install awscli" >&2
@@ -115,6 +119,27 @@ cleanup_s3_orphans() {
   local canonical_count; canonical_count=$(wc -l < "$canonical_file" | tr -d ' ')
   log "  $canonical_count packages referenced in committed pkgsinfo"
 
+  # SAFETY FLOOR: a tiny canonical set almost always means the wrong
+  # deployment dir or a sparse checkout. Refuse to prune.
+  if (( canonical_count < MUNKI_MIN_PKGSINFO_FOR_VALID )); then
+    log "ABORT orphan cleanup: canonical set has only $canonical_count entries (min $MUNKI_MIN_PKGSINFO_FOR_VALID)."
+    rm -f "$canonical_file"
+    return 0
+  fi
+  if ! validate_munki_deployment "$REPO_ROOT/deployment"; then
+    log "ABORT orphan cleanup: '$REPO_ROOT/deployment' does not validate as a Munki deployment."
+    rm -f "$canonical_file"
+    return 0
+  fi
+
+  # Keep packages that open branches reference: pre-push-pr-packages uploaded
+  # them before the branch merged.
+  local branch_file; branch_file=$(mktemp)
+  remote_branch_pkg_locations > "$branch_file" || true
+  sort -u "$canonical_file" "$branch_file" -o "$canonical_file"
+  log "  $(wc -l < "$branch_file" | tr -d ' ') package reference(s) across remote branches kept"
+  rm -f "$branch_file"
+
   local s3_list; s3_list=$(mktemp)
   # List S3 objects under deployment/pkgs/, normalise to relative keys
   aws s3 ls "$S3_URL/deployment/pkgs/" --recursive --region "$AWS_REGION" 2>/dev/null | \
@@ -126,6 +151,15 @@ cleanup_s3_orphans() {
   local orphans; orphans=$(mktemp)
   comm -23 "$s3_list" "$canonical_file" > "$orphans"
   local orphan_count; orphan_count=$(wc -l < "$orphans" | tr -d ' ')
+
+  # HARD CAP: never silently mass-delete from S3.
+  if (( orphan_count > S3_ORPHAN_DELETION_CAP )); then
+    log "ABORT orphan cleanup: $orphan_count S3 orphans exceed cap ($S3_ORPHAN_DELETION_CAP)."
+    head -20 "$orphans" | while IFS= read -r o; do log "    - $o"; done
+    log "  Review manually or raise MUNKI_S3_ORPHAN_DELETION_CAP if intentional."
+    rm -f "$canonical_file" "$s3_list" "$orphans"
+    return 0
+  fi
 
   if (( orphan_count > 0 )); then
     log "Found $orphan_count orphan object(s) in S3:"
@@ -188,11 +222,16 @@ if [[ ${#TARGET_PATHS[@]} -gt 0 ]]; then
 fi
 
 # ── branch gate ────────────────────────────────────────────
+# A branch push gets the narrow, additive path: every package its pkgsinfo
+# reference must already be in storage or be uploaded now, create-only.
+# Catalog checks, full syncs and orphan deletion stay on main.
 current_branch=$(git symbolic-ref --quiet --short HEAD || true)
 if [[ "$current_branch" != "main" && "$current_branch" != "master" ]]; then
-  log "Skipping upload — branch '$current_branch' is not main/master."
+  log "Branch '$current_branch' — checking the packages its pkgsinfo reference"
+  pr_status=0
+  "$HOOK_DIR/pre-push-pr-packages" 2>&1 | tee -a "$LOGFILE" || pr_status=$?
   mv "$LOGFILE" "${LOGFILE%.*}-$(next_index).log"
-  exit 0
+  exit "$pr_status"
 fi
 
 # ── fast-forward guard ─────────────────────────────────────
@@ -271,7 +310,10 @@ find "$REPO_ROOT" -name ".azDownload*" -type f -delete 2>/dev/null || true
 
 log "On branch '$current_branch' — syncing: $changed_paths"
 
-SYNC_OPTS=(--delete --exclude "*.DS_Store" --only-show-errors --region "$AWS_REGION")
+# Uploads are additive: a sync never deletes, because a checkout missing part
+# of the package cache would otherwise delete those packages from S3. Removal
+# is cleanup_s3_orphans' job, against committed pkgsinfo, capped.
+SYNC_OPTS=(--exclude "*.DS_Store" --only-show-errors --region "$AWS_REGION")
 [[ "$DRY_RUN" == "true" ]] && SYNC_OPTS+=(--dryrun)
 
 if [[ "$changed_paths" == "all" ]] || echo "$changed_paths" | grep -q "pkgs"; then
