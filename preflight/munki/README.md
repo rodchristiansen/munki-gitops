@@ -34,7 +34,8 @@ and a broken inventory lookup must never stop software from installing.
 Edit the block at the top of `payload/preflight`: mirror hosts, the cloud repo
 URL, the provisioning manifests, the retire statuses and the decommission
 manifest. Keep the retire statuses in step with `RETIRE_STATUSES` in
-`enrollment/shared/hierarchy.py`.
+`enrollment/shared/hierarchy.py` in
+[intune-gitops](https://github.com/windowsadmins/intune-gitops).
 
 The script reuses Munki's own `AdditionalHttpHeaders`, so a repo behind Basic
 or Bearer auth needs no second credential. The headers reach curl through a

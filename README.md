@@ -94,8 +94,8 @@ Entra groups, configuration profiles, and App Store apps.
 
 ```
 inventory/     the twelve-column contract, a sample fleet, and the projection script
-enrollment/    one consumer per system; the Intune one builds the group ladder
-intune/        renders three manifest keys the client ignores into Intune
+enrollment/    the Munki consumer; the Intune group ladder lives in intune-gitops
+intune/        manifests and pipeline callers for the shared intune-gitops engine
 ```
 
 **The idea.** Four inventory columns — `usage`, `catalog`, `area`, `location` —
@@ -143,13 +143,37 @@ stored in Intune metadata instead. VPP identifiers and assignment metadata live
 under `pkgsinfo/apps/managed/`, not in the pipeline body. New release-controller
 logic stays inline in the pipeline YAML so deployment remains self-contained.
 
-**Try it offline.** No tenant, no credentials, PyYAML the only dependency:
+**Try it offline.** No tenant, no credentials, PyYAML the only dependency.
+The Intune engine and the shared enrollment code live in
+[intune-gitops](https://github.com/windowsadmins/intune-gitops), so check it out
+beside this repo at the tag the pipelines pin:
+
+```
+git clone --branch v0.1.2 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+```
+
+Project the inventory:
 
 ```
 python3 inventory/projections/project.py inventory/inventory.csv --out-dir out/
-cd enrollment && python3 -m consumers.intune ../out/intune.csv --what-if
-cd ../intune && python3 -m stages.lint_conditions manifests/
-python3 -m stages.plan_assignments manifests/
+```
+
+Plan the group ladder:
+
+```
+PYTHONPATH="enrollment:../intune-gitops/enrollment" python3 -m consumers.intune out/intune.csv --what-if
+```
+
+Lint the manifest conditions:
+
+```
+python3 ../intune-gitops/engine/stages/lint_conditions.py --platform macos intune/manifests
+```
+
+Plan the assignments:
+
+```
+python3 ../intune-gitops/engine/stages/plan_assignments.py --platform macos intune/manifests
 ```
 
 With no `GRAPH_TOKEN` the Intune consumer prints the group plan and stops. Run

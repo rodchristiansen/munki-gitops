@@ -21,3 +21,6 @@ __pycache__/
 
 # Task worktrees
 /.worktrees/
+
+# The shared Intune engine, when checked out for a local run or by CI
+/.intune-gitops/

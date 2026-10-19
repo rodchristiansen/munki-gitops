@@ -23,23 +23,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Shared Intune engine
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: windowsadmins/intune-gitops
+          ref: 36359ce4594e1012542592a940b346ed20ed09db # v0.1.2
+          path: .intune-gitops
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
       - run: python -m pip install --quiet pyyaml
-      - name: Enrollment tests
+      - name: Munki enrollment consumer tests
+        env:
+          PYTHONPATH: enrollment:.intune-gitops/enrollment
         run: python -m unittest discover -s enrollment/tests -v
-      - name: Intune tests
-        run: python -m unittest discover -s intune/tests -v
       - name: Inventory projection
         run: |
           python inventory/projections/project.py inventory/inventory.csv --out-dir "$RUNNER_TEMP/out"
-          test -s "$RUNNER_TEMP/out/munki.csv"
+          head -1 "$RUNNER_TEMP/out/munki.csv" | tr -d '\r' | grep -qx 'serial,catalog,area,location,asset,usage,status,allocation,username,platform,hostname,fleet'
       - name: Intune lint and plan on the sample manifests
-        working-directory: intune
         run: |
-          python -m stages.lint_conditions manifests/
-          python -m stages.plan_assignments manifests/
+          python .intune-gitops/engine/stages/lint_conditions.py --platform macos intune/manifests
+          python .intune-gitops/engine/stages/plan_assignments.py --platform macos intune/manifests
+      - name: Catalog and PayloadVersion invariants
+        run: python intune/checks/profile_invariants.py
       - name: Sample managed-app descriptors pass the hook linter
         run: |
           python - <<'PY'
@@ -63,7 +71,7 @@ jobs:
           import pathlib, sys, yaml
           bad = []
           for p in pathlib.Path('.').rglob('*.y*ml'):
-              if '.git' in p.parts:
+              if '.git' in p.parts or '.intune-gitops' in p.parts:
                   continue
               try:
                   list(yaml.safe_load_all(p.read_text(encoding='utf-8')))

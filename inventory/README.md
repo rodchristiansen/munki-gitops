@@ -77,8 +77,8 @@ rows:
 |---|---|---|
 | `munki.csv` | Macintosh | `../enrollment/consumers/munki.py` |
 | `cimian.csv` | Windows | the Cimian repo's equivalent consumer |
-| `intune.csv` | all | `../enrollment/consumers/intune.py` — builds the group ladder |
-| `mdm.csv` | all | `../enrollment/consumers/mdm.py` — ADE / Autopilot routing |
+| `intune.csv` | all | `consumers/intune.py` in [intune-gitops](https://github.com/windowsadmins/intune-gitops) — builds the group ladder |
+| `mdm.csv` | all | your ADE / Autopilot routing (no consumer ships here) |
 
 Add a target by adding an entry to `COLUMNS` in `project.py`, and to `PLATFORM`
 if it only wants one platform.
