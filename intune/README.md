@@ -5,13 +5,20 @@ The manifest tree becomes MDM state. Three keys the client ignores —
 reviewed YAML, and this layer renders them into Intune: VPP apps, mobileconfig
 and Settings Catalog profiles, and shell scripts.
 
+The engine that does this is shared with the Windows sibling and lives in
+[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops).
+This directory keeps only what is Munki's: the manifests, the profiles, the
+catalog and PayloadVersion check and the pipelines that call the engine at a
+pinned tag (currently `v0.1.4`). Stages, guards, the condition translator and
+their tests are documented and tested there.
+
 The Windows half of the same pattern lives in
 [cimian-gitops](https://github.com/windowsadmins/cimian-gitops). Same keys, same
-path-to-group rule, same guards; only the render targets differ.
+path-to-group rule, same engine; only the render targets differ.
 
 **This writes to a live tenant.** Every stage plans before it writes, and
-`WHATIF=true` is a supported way to run rather than a debug flag. Run the plan
-first, read the actual object names it prints, and only then let it write.
+whatIf is the default. Run the plan first, read the object names it prints, and
+only then let it write.
 
 ## Why the addressing works
 
@@ -30,35 +37,91 @@ manifest tree that is not built this way and nothing happens, because there is
 no group on the other end of the path. The keys are not the clever part; the
 shared address space is.
 
+## Layout
+
+| Path | What it is |
+|---|---|
+| `manifests/` | The sample manifest tree. A path is an address: `manifests/Assigned/Staff/IT.yaml` is the group `Devices-Assigned-Staff-IT`. |
+| `profiles/` | Profile definitions the manifests name, including `profiles/Apps/` mobileconfigs. |
+| `checks/profile_invariants.py` | The Munki-only check: every profile and managed app declares a cumulative prefix of Development, Testing, Staging, Production, and every payload's `PayloadVersion` is the integer 1. |
+| `pipelines/azure/intune-mgmt.yml` | Azure Pipelines caller for the intune-gitops stages template. |
+| `pipelines/github/intune-mgmt.yml` | GitHub Actions caller for the intune-gitops composite action. Copy it into `.github/workflows/` to run it. |
+| `pipelines/reference/` | The production pipeline, sanitized. See below. |
+
 ## Try it, offline
 
-```
-python3 -m stages.lint_conditions manifests/
-python3 -m stages.plan_assignments manifests/
-```
-
-The plan is the artefact worth reading in a pull request. On the sample tree it
-resolves sixteen assignments across three keys, attaches two assignment filters,
-and reports one live exclusion and one inert one.
-
-Then the failure modes:
+Check the engine out beside this repo at the pinned tag, and install PyYAML:
 
 ```
-python3 -m stages.lint_conditions tests/fixtures/broken/
+git clone --branch v0.1.4 https://github.com/windowsadmins/intune-gitops ../intune-gitops
 ```
 
-Five findings, exit 1.
+```
+pip install pyyaml
+```
 
-## Two pipelines in here, on purpose
+From the repo root, lint the tree. Every condition has to translate into an
+assignment filter, or the build fails:
 
-`pipelines/azure/` and `pipelines/github/` are thin: every stage is a module
-under `stages/`. That is the recommended shape and the one to read first.
+```
+python3 ../intune-gitops/engine/stages/lint_conditions.py --platform macos intune/manifests
+```
+
+Then plan it. The plan is the artefact worth reading in a pull request. On the
+sample tree it resolves sixteen assignments across three keys, attaches two
+assignment filters, and reports one live exclusion and one inert one:
+
+```
+python3 ../intune-gitops/engine/stages/plan_assignments.py --platform macos intune/manifests
+```
+
+Then the Munki check:
+
+```
+python3 intune/checks/profile_invariants.py
+```
+
+## Conditions on macOS
+
+Assignment filters expose only `deviceName`, `manufacturer`, `model`,
+`osVersion`, `deviceCategory` and `enrollmentProfileName`. Munki conditions are
+evaluated on the device against facts it collects locally, so they can
+reference almost anything. Only `hostname`, `machine_type` and `os_vers_major`
+translate, with `AND` / `OR` / `NOT` and parentheses.
+
+Filters have no ordered comparison, so `os_vers_major >= 15` does not
+translate; name the major version exactly instead:
+
+```
+- condition: os_vers_major == 26
+```
+
+`machine_model` looks supported and is not. The filter's `model` property holds
+the marketing name (`MacBook Pro`), never the hardware identifier
+(`MacBookPro16,1`), so a condition on the identifier would translate cleanly,
+produce a valid filter, and match nothing. The linter refuses it.
+
+The full table, and the rules Intune enforces on `NOT`, are in the
+[intune-gitops README](https://github.com/windowsadmins/intune-gitops#conditions-become-assignment-filters).
+
+## Pipelines
+
+Both callers pin intune-gitops: the Azure one by `ref: refs/tags/v0.1.4` on its
+repository resource, the GitHub one by the tag's commit SHA. An engine change
+reaches this repo only when the pin moves. Both pass the Munki check into the
+engine's test stage.
+
+The real apply runs only from `main`, behind an environment, with a separate
+write identity. The YAML conditions are a convenience; the boundary is the
+approvals, branch control and required-template checks on the write service
+connection and environment (Azure), or the environment protection rules and
+federated credential (GitHub). Set those up from
+[pipelines/README.md](https://github.com/windowsadmins/intune-gitops/blob/v0.1.4/pipelines/README.md)
+in intune-gitops before the first real run.
 
 `pipelines/reference/` is the production pipeline, lifted nearly as-is and
-sanitized. It is there for accuracy, not as a model — several thousand lines of
-script inline in YAML is exactly why the test suite has to test extracted logic
-rather than the file that ships, and why the condition translator exists twice
-in it with a comment between the copies saying "keep these in sync". Come here
+sanitized. It is there for accuracy, not as a model: several thousand lines of
+script inline in YAML is why the engine moved into tested modules. Come here
 when you want to see how it is really wired, or what a stage does that the
 sample omits.
 
@@ -67,51 +130,6 @@ container names are placeholders, and the Teams webhook reads from a variable
 group. If you lift your own, check that last one especially — a Power Automate
 URL with a `sig=` parameter is a working credential, and a pipeline file is not
 where it belongs.
-
-## Stages
-
-| Stage | Does |
-|---|---|
-| `lint_conditions` | Fails the build on anything the assign stages cannot honour. Runs first, gates everything. |
-| `plan_assignments` | Resolves the tree into the assignments it implies. No tenant needed. |
-| `apply_assignments` | Writes them. Refuses a partial plan, refuses an empty assignment set. |
-
-## The four lint rules
-
-The stage exists because of one specific failure. The assign stage, meeting a
-condition it could not translate, logged one INFO line and skipped the block.
-That is correct behaviour there — assigning without the filter would apply the
-thing to every device in the group instead of the subset you meant. But a skip
-is invisible. A phased rollout aimed by an untranslatable condition simply did
-not happen, on a green build.
-
-1. `managed_profiles` / `managed_scripts` under a condition with no filter
-   equivalent — the silent skip.
-2. A malformed condition.
-3. `managed_apps` nested under `conditional_items` — the app stage reads only
-   top-level `managed_apps`, so a conditional one is dropped without a word.
-4. A condition that translates but emits an operator the platform rejects.
-
-## What a condition can and cannot say
-
-Assignment filters expose only `deviceName`, `manufacturer`, `model`,
-`osVersion`, `deviceCategory` and `enrollmentProfileName`. Munki conditions are
-evaluated on the device against facts it collects locally, so they can reference
-almost anything. Everything hard about `lib/conditions.py` comes from that gap.
-
-Supported: `hostname`, `machine_type`, `os_vers_major`, with `AND` / `OR` /
-`NOT` and parentheses.
-
-Not supported: `arch`, `serial_number`, `catalogs`, custom facts — and
-`machine_model`, which looks supported and is not. The filter's `model`
-property holds the marketing name (`MacBook Pro`), never the hardware
-identifier (`MacBookPro16,1`), so a condition on the identifier translates
-cleanly, produces a valid filter, and matches nothing.
-
-`lib/conditions.py` is imported by both the linter and the assign stages. In
-the production pipeline this logic exists twice with a comment between the
-copies saying "keep these in sync", which is a module wearing a disguise. This
-is the module.
 
 ## Guards
 
@@ -144,32 +162,14 @@ only when its group is a strict descendant of a group the item actually reaches.
 An exclusion list full of no-ops is a list nobody reads, which is how the one
 that matters gets missed.
 
-## Environment
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `WHATIF` | unset | `true` to log every write instead of making it |
-| `MIN_DESIRED_ASSIGNMENTS` | `3` | Floor below which a run is treated as a parse failure |
-| `INTUNE_MANAGED_MARKER` | `managed-by-gitops` | Marks the objects this pipeline owns |
-| `INTUNE_GROUP_PREFIX` | `Devices` | First component of every group name |
-| `PROTECTED_PROFILES` | `protected-profiles.yaml` | Profiles another pipeline owns |
-| `GRAPH_TOKEN` | unset | Required only to apply |
-
 ## Graph permissions
 
-- `DeviceManagementConfiguration.ReadWrite.All` — configuration profiles and Settings Catalog policies
+The whatIf apply signs in with a read-only identity; the real apply with a
+write identity used only inside the gated deployment.
+
+- `DeviceManagementConfiguration.ReadWrite.All` — configuration profiles and Settings Catalog policies (write identity)
 - `DeviceManagementManagedDevices.Read.All` — enumerate devices, force-sync
 - `Group.Read.All` — resolve group names to ids
 
 The enrollment layer needs more, because it creates groups and manages device
 objects. See `../enrollment/README.md`.
-
-## Tests
-
-```
-python3 tests/test_intune.py
-```
-
-Fifteen assertions covering translation, the manifest walk, all four lint rules,
-filter attachment, exclusion liveness, and the assignment floor. No tenant, no
-credentials, PyYAML the only dependency.

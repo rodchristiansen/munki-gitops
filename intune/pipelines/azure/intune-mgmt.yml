@@ -1,8 +1,14 @@
-# Manifest tree -> Intune. Thin: every stage is a module under intune/stages/.
+# Manifest tree -> Intune, through the shared intune-gitops template.
 #
-# The lint stage has dependsOn: [] and gates everything, because the failure it
-# catches -- a condition that cannot be translated, skipped in silence -- is
-# invisible once the run is underway.
+# The lint, test, plan and apply stages, and the gate on the real apply, live
+# in windowsadmins/intune-gitops at the pinned tag. This file supplies Munki's
+# side only: where the manifests are, which connections and environment to
+# use, and the catalog and PayloadVersion check for the test stage. Moving the
+# engine means moving `ref`.
+#
+# The write connection and the environment need approvals, branch control on
+# refs/heads/main and a required-template check on the template at this tag.
+# See pipelines/README.md in intune-gitops.
 
 trigger:
   branches:
@@ -19,125 +25,25 @@ parameters:
     displayName: 'Plan only: log every write instead of making it'
     type: boolean
     default: true
-  - name: allowLargeShrink
-    displayName: 'Permit a removal batch above the cap'
-    type: boolean
-    default: false
 
-variables:
-  - name: azureServiceConnection
-    value: '$(INTUNE_SERVICE_CONNECTION)'
+resources:
+  repositories:
+    - repository: intune_gitops
+      type: github
+      endpoint: github-public
+      name: windowsadmins/intune-gitops
+      ref: refs/tags/v0.1.4
 
 stages:
-  - stage: lint
-    displayName: 'Lint manifest conditions'
-    dependsOn: []
-    jobs:
-      - job: lint
-        pool:
-          vmImage: 'ubuntu-latest'
-        steps:
-          - checkout: self
-            fetchDepth: 1
-          - script: pip install pyyaml
-            displayName: 'Dependencies'
-          - script: python3 -m stages.lint_conditions manifests/
-            workingDirectory: intune
-            displayName: 'Every condition must translate'
-
-  - stage: test
-    displayName: 'Test'
-    dependsOn: lint
-    jobs:
-      - job: test
-        pool:
-          vmImage: 'ubuntu-latest'
-        steps:
-          - checkout: self
-            fetchDepth: 1
-          - script: pip install pyyaml
-            displayName: 'Dependencies'
-          - script: python3 tests/test_intune.py
-            workingDirectory: intune
-            displayName: 'Assignment and translation guards'
-          - script: |
-              python3 - <<'PY'
-              import pathlib
-              import plistlib
-              import yaml
-
-              waterfall = ["Development", "Testing", "Staging", "Production"]
-              for path in pathlib.Path("intune/profiles").rglob("*.yaml"):
-                  catalogs = (yaml.safe_load(path.read_text()) or {}).get("catalogs") or []
-                  if not catalogs or catalogs != waterfall[:len(catalogs)]:
-                      raise SystemExit(f"{path}: catalogs must be a cumulative waterfall prefix")
-              for path in pathlib.Path("pkgsinfo/apps/managed").rglob("*.yaml"):
-                  catalogs = (yaml.safe_load(path.read_text()) or {}).get("catalogs") or []
-                  if not catalogs or catalogs != waterfall[:len(catalogs)]:
-                      raise SystemExit(f"{path}: catalogs must be a cumulative waterfall prefix")
-              for path in pathlib.Path("intune/profiles").rglob("*.mobileconfig"):
-                  profile = plistlib.loads(path.read_bytes())
-                  catalogs = profile.get("Catalogs") or []
-                  if not catalogs or catalogs != waterfall[:len(catalogs)]:
-                      raise SystemExit(f"{path}: Catalogs must be a cumulative waterfall prefix")
-                  def validate(value):
-                      if isinstance(value, dict):
-                          if "PayloadType" in value and (type(value.get("PayloadVersion")) is not int or value["PayloadVersion"] != 1):
-                              raise SystemExit(f"{path}: every PayloadVersion must be integer 1")
-                          for child in value.values(): validate(child)
-                      elif isinstance(value, list):
-                          for child in value: validate(child)
-                  validate(profile)
-              PY
-            displayName: 'Catalog and PayloadVersion invariants'
-          - script: python3 tests/test_group_ladder.py
-            workingDirectory: enrollment
-            displayName: 'Group membership guards'
-
-  - stage: plan
-    displayName: 'Plan'
-    dependsOn: test
-    jobs:
-      - job: plan
-        pool:
-          vmImage: 'ubuntu-latest'
-        steps:
-          - checkout: self
-            fetchDepth: 1
-          - script: pip install pyyaml
-            displayName: 'Dependencies'
-          - script: python3 -m stages.plan_assignments manifests/
-            workingDirectory: intune
-            displayName: 'Assignments this tree implies'
-
-  - stage: apply
-    displayName: 'Apply'
-    dependsOn: plan
-    condition: and(succeeded(), eq('${{ parameters.whatIf }}', false))
-    jobs:
-      - job: apply
-        pool:
-          vmImage: 'ubuntu-latest'
-        steps:
-          - checkout: self
-            fetchDepth: 1
-          - script: pip install pyyaml requests
-            displayName: 'Dependencies'
-          - task: AzureCLI@2
-            displayName: 'Acquire Graph token'
-            inputs:
-              azureSubscription: '$(azureServiceConnection)'
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
-                TOKEN=$(az account get-access-token \
-                  --resource https://graph.microsoft.com \
-                  --query accessToken -o tsv)
-                echo "##vso[task.setvariable variable=GRAPH_TOKEN;issecret=true]$TOKEN"
-          - script: python3 -m stages.apply_assignments manifests/
-            workingDirectory: intune
-            displayName: 'Write assignments'
-            env:
-              GRAPH_TOKEN: $(GRAPH_TOKEN)
-              WHATIF: ${{ parameters.whatIf }}
-              ALLOW_LARGE_SHRINK: ${{ parameters.allowLargeShrink }}
+  - template: pipelines/azure/intune-mgmt.yml@intune_gitops
+    parameters:
+      platform: macos
+      manifestsPath: intune/manifests
+      readServiceConnection: intune-graph-read
+      writeServiceConnection: intune-graph-write
+      environment: intune-production
+      whatIf: ${{ parameters.whatIf }}
+      validationSteps:
+        - script: pip install pyyaml && python3 intune/checks/profile_invariants.py
+          workingDirectory: $(Pipeline.Workspace)/s/self
+          displayName: 'Catalog and PayloadVersion invariants'

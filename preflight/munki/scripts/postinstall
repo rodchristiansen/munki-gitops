@@ -1,0 +1,6 @@
+#!/bin/zsh
+# Munki refuses to run a preflight that is not owned by root or is writable by
+# anyone else, so set both whatever the package ownership came out as.
+chown root:wheel /usr/local/munki/preflight
+chmod 755 /usr/local/munki/preflight
+exit 0

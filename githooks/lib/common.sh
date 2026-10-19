@@ -338,3 +338,24 @@ validate_munki_deployment() {
   done < <(find "$dep/pkgsinfo" -type f \( -name '*.yaml' -o -name '*.yml' -o -name '*.plist' \) 2>/dev/null)
   return 1
 }
+
+# ── remote-branch keep set ─────────────────────────────────────────────────
+# Branch pushes upload their packages before the branch merges
+# (pre-push-pr-packages). Orphan cleanup on main must not delete those, so it
+# keeps every installer_item_location referenced on any remote branch as well
+# as on the checkout. Prints one location per line, relative to
+# deployment/pkgs, in YAML and plist pkgsinfo alike.
+remote_branch_pkg_locations() {
+  local -a refs
+  local ref
+  while IFS= read -r ref; do
+    [[ -n "$ref" && "$ref" != */HEAD ]] && refs+=("$ref")
+  done < <(git for-each-ref --format='%(refname)' refs/remotes/ 2>/dev/null)
+  (( ${#refs[@]} )) || return 0
+  git grep -h -A1 -E 'installer_item_location' "${refs[@]}" -- deployment/pkgsinfo/ 2>/dev/null | awk '
+    /^[[:space:]]*installer_item_location:/ {
+      sub(/^[[:space:]]*installer_item_location:[[:space:]]*/, ""); gsub(/["\047]/, ""); print; next }
+    /<key>installer_item_location<\/key>/ { want = 1; next }
+    want && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; want = 0; next }
+    { want = 0 }' | sed -e 's#^/##' -e 's#^deployment/pkgs/##' -e 's#^pkgs/##' | sort -u
+}

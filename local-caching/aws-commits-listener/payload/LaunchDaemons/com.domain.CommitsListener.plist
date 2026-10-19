@@ -2,31 +2,40 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Disabled</key>
-    <false/>
-    <key>KeepAlive</key>
-    <true/>
     <key>Label</key>
     <string>com.domain.CommitsListener</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/node</string>
-        <string>/Library/Management/CommitsListener/service-bus-listener.js</string>
+        <string>/usr/bin/env</string>
+        <string>node</string>
+        <string>/Library/Management/CommitsListener/sqs-listener.js</string>
     </array>
-    <key>RunAtLoad</key>
-    <false/>
-    <key>UserName</key>
-    <string>admin</string>
     <key>WorkingDirectory</key>
     <string>/Library/Management/CommitsListener/</string>
-    <key>StartInterval</key>
-    <integer>3600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>UserName</key>
+    <string>admin</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
         <string>/Users/admin</string>
-        <key>USER</key>
-        <string>admin</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>MUNKI_REPO_URL</key>
+        <string>https://git.example.com/org/munki-repo.git</string>
+        <key>MUNKI_WORKING_COPY</key>
+        <string>/Users/Shared/munki-repo</string>
+        <key>MUNKI_AWS_REGION</key>
+        <string>us-east-1</string>
+        <key>MUNKI_SQS_URL</key>
+        <string>https://sqs.us-east-1.amazonaws.com/123456789012/munki-commits</string>
+        <key>MUNKI_BUCKET_URL</key>
+        <string>s3://example-munki-bucket</string>
     </dict>
 </dict>
 </plist>

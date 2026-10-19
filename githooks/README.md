@@ -9,8 +9,6 @@ Two parallel implementations ship here:
 
 Both use the same hook names, same flags, same env-var bypass, same safety guards. Pick the cloud you're on; the admin UX is identical.
 
-> Installed across a production Munki fleet of 800+ devices and 1200+ pkgsinfo files. The guards have caught real problems; the docs below explain what, why, and how to reproduce.
-
 ## Contents
 
 | Path                              | Purpose                                                         |
@@ -20,11 +18,13 @@ Both use the same hook names, same flags, same env-var bypass, same safety guard
 | `lib/pkgsinfo-lint.py`            | Structural pkgsinfo validator (Munki-native schema).             |
 | `lib/resolve-superseded-pkgsinfo.py` | Auto-removes older pkgsinfo whose installer was retired by `repoclean`, when a newer version is present locally. |
 | `azure/pre-commit`                | Validate pkgsinfo, auto-download missing pkgs, block bad commits. |
-| `azure/pre-push`                  | Sync changes to Azure Blob, remove orphans from blob storage.    |
+| `azure/pre-push`                  | Main: sync changes to Azure Blob, remove orphans. Branches: hand off to `pre-push-pr-packages`. |
+| `azure/pre-push-pr-packages`      | Branch pushes: upload each package the pushed pkgsinfo need, create-only, keyed by SHA-256. |
 | `azure/post-merge`                | Download packages referenced by newly-pulled pkgsinfo.           |
 | `azure/post-rewrite`              | Safety net for `git rebase` / `git commit --amend`.              |
 | `azure/post-checkout`             | (Optional) per-admin secrets bootstrap scaffolding.              |
 | `aws/*`                           | Parallel implementation against S3.                              |
+| `tests/*.zsh`                     | Offline tests with fake `az`, `azcopy` and `aws`.                |
 
 ## Install
 
@@ -71,6 +71,9 @@ The hooks read environment variables for everything that might differ between or
 
 | Variable                        | Default                                                        | Purpose                             |
 |---------------------------------|----------------------------------------------------------------|-------------------------------------|
+| `MUNKI_MIN_PKGSINFO_FOR_VALID`  | `50`                                                           | Floor below which orphan cleanup refuses to run (a sparse or wrong checkout). |
+| `MUNKI_AZURE_ORPHAN_DELETION_CAP` / `MUNKI_S3_ORPHAN_DELETION_CAP` | `50`                     | Most orphans one push may delete from storage. |
+| `MUNKI_MANAGED_APP_CATEGORIES`  | *(empty)*                                                      | Optional comma-separated vocabulary for `category` in Intune app descriptors. |
 | `MUNKI_MAX_FILE_SIZE_MB`        | `50`                                                           | Binary-size guard threshold.        |
 | `MUNKI_ALLOW_BINARY_PATHS`      | `^deployment/pkgs/:^deployment/icons/`                         | Colon-separated regexes of paths where big files are allowed. |
 | `MUNKI_WORKTREE_LINK_PATHS`     | `deployment/pkgs:deployment/icons:deployment/catalogs`         | Colon-separated paths to symlink in linked worktrees. |
@@ -106,12 +109,26 @@ Also honoured: `git pull --no-verify`, `git merge --no-verify` — parsed out of
 
 ### `pre-push`
 
-1. **Branch gate** — only syncs when pushing `main`; other branches push freely.
-2. **Fast-forward check** — pulls if behind; aborts on non-FF.
-3. **`makecatalogs` re-validate** — one last check against reality.
-4. **Targeted or bulk sync** — uploads only the files referenced by changed pkgsinfo, or everything with `--sync`.
-5. **MD5 hash metadata** — Azure uploads use `--put-md5` so future `--compare-hash=MD5` runs actually have something to compare.
-6. **Azure/S3 orphan cleanup** — removes blob/object storage entries not referenced by any committed pkgsinfo (main only).
+What a push does depends on the branch.
+
+**A branch other than main** runs `pre-push-pr-packages`. It reads the refs git passes on stdin, finds the pkgsinfo the pushed commits add or change, and for each one:
+
+1. Skips `nopkg`, `profile` and `apple_update_metadata` items and Intune descriptors under `apps/managed/`, which have no package.
+2. Refuses an `installer_item_location` that is absolute or contains an empty or `..` segment. A location becomes a local path and a storage key, so it must stay under `deployment/pkgs/`.
+3. Accepts a package already in storage only when its `sha256` metadata matches the pkgsinfo's `installer_item_hash`.
+4. Uploads a missing package create-only (`azcopy --overwrite=false`, S3 `--if-none-match '*'`) after checking the local file's SHA-256, and records that hash in the object's metadata. Losing a create race to the same bytes is fine; to different bytes it blocks.
+5. Refuses to replace a package path that holds different bytes. Package paths are immutable: clients and the CDN cache them for a year.
+6. Records SHA-256 metadata on a legacy object only with proof: its MD5 (Azure) or single-part ETag (S3) matches the local file, or `origin/main` already assigns that hash to that path.
+
+It never deletes. The push pipeline's gate then finds every package it needs.
+
+**main** gets the full path:
+
+1. **Fast-forward check** — pulls if behind; aborts on non-FF.
+2. **`makecatalogs` re-validate** — one last check against reality.
+3. **Targeted or bulk sync** — uploads only what changed, or everything with `--sync`. Uploads are additive: a checkout missing part of the package cache never deletes those packages from storage.
+4. **MD5 hash metadata** — Azure uploads use `--put-md5` so future `--compare-hash=MD5` runs actually have something to compare.
+5. **Orphan cleanup** — removes storage objects no pkgsinfo references, after a floor (`MUNKI_MIN_PKGSINFO_FOR_VALID`), a deployment check and a cap. Packages referenced on any remote branch are kept, because branch pushes upload them before the branch merges.
 
 Flags: `--sync` (skip change detection), `--force` (double-confirm: `y` then literal `FORCE`), `--dry-run`, `--path <relative>` (targeted file).
 
@@ -171,6 +188,10 @@ Make sure `core.hooksPath` is set inside the worktree, and the `githooks/` path 
 - Duplicate top-level YAML keys (silently drops earlier values).
 - Empty `catalogs: []`.
 
+**Intune app descriptors** under `pkgsinfo/apps/managed/` are not pkginfo, so they get their own rules: only the known keys; `source: apple_vpp`; a quoted `store_id`; an `assignment` with `intent` (`available` or `required`) and boolean `device_licensing` and `prevent_auto_update`; and `catalogs` as a cumulative prefix of `Development, Testing, Staging, Production`. Set `MUNKI_MANAGED_APP_CATEGORIES` to close the `category` vocabulary.
+
+`nopkg` items marked `OnDemand` are exempt from the install-loop check: Munki runs them only when the user asks.
+
 Catalogs and required-by-installer-type rules are validated. Full schema is at the top of `pkgsinfo-lint.py` — edit freely if your Munki deployment diverges.
 
 ## Extending
@@ -184,6 +205,14 @@ Catalogs and required-by-installer-type rules are validated. Full schema is at t
 **New structural check** → add a test in `issues_for_file` in `pkgsinfo-lint.py`. Always return a specific, human-readable error — no `validation failed`.
 
 When bumping functionality that admins must have, bump `.min-version` and the hook's own `HOOK_VERSION=` stamp in the same commit.
+
+## Tests
+
+The tests build throwaway repos and fake the cloud CLIs, so they need no account:
+
+```sh
+for t in githooks/tests/*.zsh; do zsh "$t"; done
+```
 
 ## Why bother?
 

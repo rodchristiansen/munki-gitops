@@ -7,7 +7,9 @@ managed_installs:
 - Firefox
 
 conditional_items:
-- condition: os_vers_major >= 15
+# Assignment filters have no ordered comparison, so a profile scoped to an
+# OS release names the major version exactly.
+- condition: os_vers_major == 26
   managed_installs:
   - ExampleAppNeedingCurrentOS
   managed_profiles:

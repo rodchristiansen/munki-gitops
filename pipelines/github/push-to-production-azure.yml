@@ -1,63 +1,173 @@
-name: Munki Deploy (Azure Blob + Front Door)
+# push-to-production-azure.yml — publish the Munki repo to Azure Blob + Front Door.
+#
+# GitHub Actions twin of pipelines/azure/push-to-production-azure.yml. Copy it to
+# .github/workflows/ in your Munki repo.
+#
+# Auth is OpenID Connect federation: azure/login exchanges the job's GitHub
+# token for an Entra token, so there is no client secret and no stored SAS to
+# rotate. Create a federated credential on the app registration (or user-
+# assigned managed identity) for repo:<owner>/<repo>:environment:munki-production,
+# and grant it Storage Blob Data Contributor on the storage account and CDN
+# Endpoint Contributor on the Front Door profile. AZURE_CLIENT_ID,
+# AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID are identifiers, not secrets, so
+# they live in repository variables.
+
+name: Munki push to production (Azure)
 
 on:
   push:
     branches: [main]
-    paths:   ['deployment/**']
+    paths: ['deployment/**']
+  workflow_dispatch:
+
+# One run at a time, and never cancel one mid-upload. Two overlapping runs can
+# finish out of order and leave the CDN serving the older catalogs.
+concurrency:
+  group: munki-push-production
+  cancel-in-progress: false
+
+# id-token: write is granted only to the job that logs in, and that job runs
+# in a protected environment. Create the environment with required reviewers
+# or a main-only deployment branch rule, and make the federated credential's
+# subject the environment, so a workflow edited on another branch cannot mint
+# a token.
+permissions:
+  contents: read
+
+env:
+  STORAGE_ACCOUNT: ${{ vars.STORAGE_ACCOUNT }}       # e.g. examplemunkistorage
+  STORAGE_CONTAINER: ${{ vars.STORAGE_CONTAINER }}   # e.g. munki
+  FD_RESOURCE_GROUP: ${{ vars.FD_RESOURCE_GROUP }}
+  FD_PROFILE: ${{ vars.FD_PROFILE }}
+  FD_ENDPOINT: ${{ vars.FD_ENDPOINT }}
+  # The Munki tools release makecatalogs comes from, pinned by SHA-256 so a new
+  # makecatalogs only reaches production through a reviewed edit. Upstream
+  # Munki reads plist pkgsinfo only; a repo with YAML pkgsinfo needs a
+  # YAML-capable build here (see munki/munki#1261).
+  MUNKITOOLS_URL: 'https://github.com/munki/munki/releases/download/v7.3.0/munkitools-7.3.0.5808.pkg'
+  MUNKITOOLS_SHA256: '4ed826bd32811ef54524a10300f66c9af4c9fdd8c243ada146d468485e1bffcc'
 
 jobs:
   deploy:
-    runs-on: macos-13
-    env:
-      AZ_STORAGE_URL: ${{ secrets.AZ_STORAGE_URL }}   # container URL w/out SAS
-      AZ_SAS:        ${{ secrets.AZ_SAS_TOKEN }}      # starts with '?sv='
-      FDO_ENDPOINT:  ${{ secrets.FD_ENDPOINT }}       # mysite.azurefd.net
-      AZ_SUBSCRIPTION: ${{ secrets.AZ_SUB }}
-      AZ_CLIENT_ID:    ${{ secrets.AZ_CLIENT_ID }}
-      AZ_TENANT_ID:    ${{ secrets.AZ_TENANT_ID }}
-      AZ_CLIENT_SECRET:${{ secrets.AZ_CLIENT_SECRET }}
-
+    runs-on: macos-latest
+    environment: munki-production
+    permissions:
+      contents: read
+      id-token: write
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
-      with:
-        sparse-checkout: |
-          deployment
-          pipelines
-        fetch-depth: 1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-    - name: Install Munki + azcopy
-      run: |
-        brew install munki
-        brew install --cask azcopy
+      - name: Install pinned makecatalogs
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o munkitools.pkg "$MUNKITOOLS_URL"
+          echo "$MUNKITOOLS_SHA256  munkitools.pkg" | shasum -a 256 -c -
+          # Expand rather than install: the runner needs makecatalogs, not the
+          # Munki LaunchDaemons.
+          pkgutil --expand-full munkitools.pkg munkitools
+          MC="$PWD/$(find munkitools -path '*/usr/local/munki/makecatalogs' -type f | head -1)"
+          [ -f "$MC" ] && [ -x "$MC" ] || { echo "makecatalogs not found in the package"; exit 1; }
+          "$MC" --version
+          echo "MAKECATALOGS=$MC" >> "$GITHUB_ENV"
 
-    - name: Build catalogs
-      run: |
-        /usr/local/munki/makecatalogs --skip-pkg-check "${{ github.workspace }}/deployment"
+      - name: Run makecatalogs
+        run: |
+          set -euo pipefail
+          REPO="$GITHUB_WORKSPACE/deployment"
+          # Intune managed-app descriptors are repo metadata, not pkginfo.
+          HELD="$(mktemp -d)/managed"
+          restore() { [ -d "$HELD" ] && mv "$HELD" "$REPO/pkgsinfo/apps/managed" || true; }
+          trap restore EXIT
+          [ -d "$REPO/pkgsinfo/apps/managed" ] && mv "$REPO/pkgsinfo/apps/managed" "$HELD"
+          # deployment/pkgs is not in git; the gate below checks packages.
+          if ! "$MAKECATALOGS" --skip-pkg-check "$REPO"; then
+            if find "$REPO/pkgsinfo" -name '*.yaml' -o -name '*.yml' | grep -q .; then
+              echo "::error::This repo has YAML pkgsinfo; point MUNKITOOLS_URL at a YAML-capable makecatalogs."
+            fi
+            exit 1
+          fi
+          restore; trap - EXIT
+          ls "$REPO/catalogs/all" >/dev/null 2>&1 || { echo "::error::makecatalogs wrote no catalogs"; exit 1; }
+          if grep -R -l -E 'source:[[:space:]]+apple_vpp|<string>apple_vpp</string>' "$REPO/catalogs"; then
+            echo "::error::An Intune managed-app descriptor reached a Munki catalog."
+            exit 1
+          fi
 
-    - name: Clean temp chunks
-      run: |
-        find deployment/pkgs -type f \( -name '*.pkg.*' -o -name '*.dmg.*' \) -delete
+      - name: Azure login (OIDC)
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-    - name: Upload to Azure Blob (azcopy)
-      run: |
-        for d in catalogs manifests pkgsinfo; do
-          azcopy sync \
-            "deployment/$d" \
-            "$AZ_STORAGE_URL/repo/deployment/$d$AZ_SAS" \
-            --recursive --delete-destination=true
-        done
+      # Mirror the container's package listing as empty placeholders and run
+      # makecatalogs with the package check on, so a pkgsinfo whose package is
+      # not in blob never reaches a catalog.
+      - name: 'Gate: every pkgsinfo package exists in blob'
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/deployment"
+          LIST="$RUNNER_TEMP/blob-pkgs.txt"
+          az storage blob list --auth-mode login \
+            --account-name "$STORAGE_ACCOUNT" --container-name "$STORAGE_CONTAINER" \
+            --prefix 'deployment/pkgs/' --num-results '*' --query '[].name' -o tsv > "$LIST"
+          echo "$(wc -l < "$LIST" | tr -d ' ') package blob(s) in the container"
+          GATE="$(mktemp -d)"
+          mkdir -p "$GATE/pkgs" "$GATE/pkgsinfo"
+          rsync -a --exclude '/apps/managed/' "$SRC/pkgsinfo/" "$GATE/pkgsinfo/"
+          while IFS= read -r name; do
+            rel="${name#deployment/pkgs/}"
+            [ -n "$rel" ] || continue
+            case "/$rel/" in */../*) echo "Skipping unsafe blob name: $name"; continue ;; esac
+            mkdir -p "$(dirname "$GATE/pkgs/$rel")"
+            : > "$GATE/pkgs/$rel"
+          done < "$LIST"
+          LOG="$RUNNER_TEMP/gate.log"
+          "$MAKECATALOGS" "$GATE" > "$LOG" 2>&1 || true
+          if grep -q 'refers to missing installer item:' "$LOG"; then
+            echo "::error::Deploy blocked: pkgsinfo reference packages that are not in blob storage."
+            grep 'refers to missing installer item:' "$LOG" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "Every referenced package is in blob storage."
 
-    - name: Purge Front Door cache
-      uses: azure/login@v2
-      with:
-        tenant-id:     ${{ env.AZ_TENANT_ID }}
-        client-id:     ${{ env.AZ_CLIENT_ID }}
-        client-secret: ${{ env.AZ_CLIENT_SECRET }}
-        subscription-id: ${{ env.AZ_SUBSCRIPTION }}
+      # Packages are uploaded by the hooks, create-only; this workflow only
+      # owns metadata. The catalogs sync deliberately does not delete.
+      - name: Sync catalogs, manifests and pkgsinfo
+        run: |
+          set -euo pipefail
+          command -v azcopy >/dev/null || brew install azcopy
+          export AZCOPY_AUTO_LOGIN_TYPE=AZCLI
+          BASE="https://$STORAGE_ACCOUNT.blob.core.windows.net/$STORAGE_CONTAINER/deployment"
+          SRC="$GITHUB_WORKSPACE/deployment"
+          azcopy sync "$SRC/catalogs" "$BASE/catalogs" --recursive --put-md5 --compare-hash=MD5
+          for d in manifests pkgsinfo; do
+            azcopy sync "$SRC/$d" "$BASE/$d" --recursive --put-md5 --compare-hash=MD5 \
+              --delete-destination=true --exclude-pattern='*.DS_Store'
+          done
 
-    - name: Purge paths
-      run: |
-        az network front-door purge-endpoint \
-          --name "$FDO_ENDPOINT" \
-          --content-paths '/*'
+      # Never purge /deployment/pkgs/*: packages are version-named and never
+      # stale at the edge. Retry Front Door's "purging concurrently" refusal;
+      # any other error fails the run.
+      - name: Purge Front Door (metadata only)
+        run: |
+          set -euo pipefail
+          attempt=0
+          until out=$(az afd endpoint purge \
+              --resource-group "$FD_RESOURCE_GROUP" \
+              --profile-name "$FD_PROFILE" \
+              --endpoint-name "$FD_ENDPOINT" \
+              --content-paths '/deployment/catalogs/*' '/deployment/manifests/*' '/deployment/pkgsinfo/*' '/deployment/icons/*' \
+              --no-wait 2>&1); do
+            attempt=$((attempt + 1))
+            if ! echo "$out" | grep -q 'purging concurrently' || [ "$attempt" -ge 10 ]; then
+              echo "$out"
+              echo "::error::Front Door purge failed"
+              exit 1
+            fi
+            echo "Front Door is still processing an earlier purge; retry $attempt in 60s"
+            sleep 60
+          done

@@ -2,14 +2,14 @@
 #
 # This is what actually runs, lifted nearly as-is and with tenant identifiers
 # replaced by placeholders. It is here for accuracy, not as the recommended
-# shape -- several thousand lines of Python inline in YAML is why the test
-# suite in ../../tests/ has to extract code out of a pipeline file to run it,
-# and why the condition translator exists twice with a comment between the
-# copies saying "keep these in sync".
+# shape -- several thousand lines of Python inline in YAML is hard to test,
+# and the condition translator exists twice with a comment between the copies
+# saying "keep these in sync".
 #
-# The readable version of the same logic is ../../stages/ and ../../lib/,
-# driven by ../azure/intune-mgmt.yml. Start there. Come here when you want to
-# see how it is really wired, or what a stage does that the sample omits.
+# The readable version of the same logic is the shared engine in
+# windowsadmins/intune-gitops, called by ../azure/intune-mgmt.yml. Start there.
+# Come here when you want to see how it is really wired, or what a stage does
+# that the sample omits.
 #
 # Sanitized: service connection, variable group, storage account and container
 # names are placeholders; the VPP app table is trimmed to three generic

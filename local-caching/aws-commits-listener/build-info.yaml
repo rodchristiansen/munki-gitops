@@ -1,0 +1,13 @@
+name: CommitsListener.pkg
+identifier: com.domain.CommitsListener
+version: '2026.10.07'
+distribution_style: true
+install_location: /Library/
+ownership: recommended
+postinstall_action: none
+suppress_bundle_relocation: true
+signing_info:
+  identity: 'Developer ID Installer: Example Org (ABCDE12345)'
+  timestamp: true
+notarization_info:
+  keychain_profile: notarization_credentials

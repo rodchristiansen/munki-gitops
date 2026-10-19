@@ -1,5 +1,14 @@
 {
+  "name": "munki-commits-listener",
+  "version": "2026.10.07",
+  "private": true,
+  "type": "module",
+  "description": "AWS SQS listener that refreshes a Munki caching server.",
+  "main": "sqs-listener.js",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "@azure/service-bus": "^7.9.4"
+    "@aws-sdk/client-sqs": "^3.600.0"
   }
 }

@@ -4,30 +4,52 @@ The client reads computers.csv to learn its own catalog/area/usage, so this
 consumer's whole job is: put the approved projection where the fleet can see it,
 and invalidate the CDN path so it is visible now rather than at TTL.
 
-    python3 -m consumers.munki out/munki.csv --what-if
+`shared` comes from intune-gitops, so put both enrollment directories on
+PYTHONPATH, this repo's first:
+
+    PYTHONPATH="enrollment:../intune-gitops/enrollment" python3 -m consumers.munki out/munki.csv --what-if
+
+A trigger in intune-gitops reaches it with
+ENROLLMENT_CONSUMERS="munki=consumers.munki:converge".
 """
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import logging
 import os
 import pathlib
-import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-
-from shared import csvdiff  # noqa: E402
+from shared import csvdiff
 
 log = logging.getLogger(__name__)
 
 REPO_PATH = os.getenv("MUNKI_COMPUTERS_CSV_PATH", "deployment/enroll/computers.csv")
 
+# The published column order, the one the preflight reads by header name. A
+# projection that arrives in any other shape is bad input, not something to
+# publish and let the fleet discover.
+EXPECTED_HEADER = [
+    "serial", "catalog", "area", "location", "asset", "usage",
+    "status", "allocation", "username", "platform", "hostname", "fleet",
+]
+
+# Refuse to publish fewer rows than this. Set it from your own fleet size: a
+# projection that suddenly shrinks is a broken export far more often than a
+# fleet that halved overnight.
+MIN_ROWS = int(os.getenv("MUNKI_MIN_ROWS", "1"))
+
 
 def converge(csv_text: str, *, what_if: bool = False) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)-8s | %(message)s")
+    header = next(csv.reader(io.StringIO(csv_text)), [])
+    if header != EXPECTED_HEADER:
+        log.error("Refusing to publish: header is %s, expected %s.", header, EXPECTED_HEADER)
+        return 1
     rows = csvdiff.parse(csv_text)
-    if not rows:
-        log.error("Refusing to publish an empty computers.csv.")
+    if len(rows) < max(MIN_ROWS, 1):
+        log.error("Refusing to publish %d row(s); the floor is %d.", len(rows), max(MIN_ROWS, 1))
         return 1
 
     log.info("%d device row(s) for the Munki repo.", len(rows))

@@ -1,5 +1,15 @@
 {
+  "name": "munki-commits-listener",
+  "version": "2026.10.07",
+  "private": true,
+  "type": "module",
+  "description": "Azure Service Bus listener that refreshes a Munki caching server.",
+  "main": "service-bus-listener.js",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "@azure/identity": "^4.13.0",
     "@azure/service-bus": "^7.9.4"
   }
 }

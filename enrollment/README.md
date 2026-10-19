@@ -6,12 +6,21 @@ state.
 
 ```
 inventory.csv
-   └── projections/project.py
-         ├── intune.csv  ──> consumers/intune.py   builds the group ladder
-         ├── munki.csv   ──> consumers/munki.py    publishes computers.csv
-         ├── cimian.csv  ──> the Cimian repo's equivalent
-         └── mdm.csv     ──> ADE / Autopilot routing
+   └── ../inventory/projections/project.py
+         ├── intune.csv  ──> intune-gitops: consumers/intune.py   builds the group ladder
+         ├── munki.csv   ──> consumers/munki.py                   publishes computers.csv
+         ├── cimian.csv  ──> the cimian-gitops equivalent
+         └── mdm.csv     ──> your ADE routing (no consumer ships here)
 ```
+
+The shared parts (the naming convention, the Graph client, the guards, the
+Intune group-ladder consumer and the triggers) live in
+[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops/tree/v0.1.4/enrollment),
+together with their tests and the reasoning behind the guards. This directory
+keeps only the Munki consumer, which imports `shared/` from there.
+
+[cimian-gitops](https://github.com/windowsadmins/cimian-gitops) runs the same
+projection for its Windows rows.
 
 ## Three properties that make this survivable
 
@@ -27,70 +36,77 @@ match this row", never "apply this change". Re-run one twice and the second run
 does nothing. You will replay these, usually at the worst moment, and a
 consumer that applies deltas will happily apply the same delta twice.
 
-## Running one
+## Setting up the path
 
-Everything plans before it writes:
+Check intune-gitops out beside this repo at the tag the pipelines pin:
 
 ```
-python3 ../inventory/projections/project.py ../inventory/inventory.csv --out-dir out/
+git clone --branch v0.1.4 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+```
+
+Then put both enrollment directories on `PYTHONPATH`, **this repo's first**.
+Both repos have a `consumers` package; this one extends its path to include
+the intune-gitops one, which only works when it is found first:
+
+```
+export PYTHONPATH="$PWD/enrollment:$PWD/../intune-gitops/enrollment"
+```
+
+## Running one
+
+Everything plans before it writes. Project the inventory, then plan each
+consumer:
+
+```
+python3 inventory/projections/project.py inventory/inventory.csv --out-dir out/
+```
+
+```
+python3 -m consumers.munki out/munki.csv --what-if
+```
+
+```
 python3 -m consumers.intune out/intune.csv --what-if
 ```
 
 With no `GRAPH_TOKEN` set, the Intune consumer prints the group plan and stops
-without making a single call. That is the first thing to run after forking —
+without making a single call. That is the first thing to run after forking:
 look at the ladder it would build before giving it credentials.
 
-## Layout
-
-| Path | What it is |
-|---|---|
-| `shared/hierarchy.py` | The naming convention. Inventory columns to group ladder to manifest path, and back. Nothing else builds a group name by hand. |
-| `shared/graph.py` | Thin Graph client: paging, group cache, throttle, whatIf. `requests` is imported lazily so the tests need no dependencies. |
-| `shared/guards.py` | Desired-set floor and removal cap. These only ever constrain removal. |
-| `shared/csvdiff.py` | Change detection against a cached copy, with `FULL_RUN` and `BYPASS_CACHE`. |
-| `consumers/` | One module per target system. Imports nothing cloud-specific. |
-| `triggers/azure-blob/` | Azure Functions doorbell. |
-| `triggers/generic-webhook/` | The same consumers behind plain HTTP. |
-| `tests/` | In-memory Graph. No network, no credentials, runs in a second. |
-
-The split between `consumers/` and `triggers/` is the load-bearing one. The blob
-trigger is an Azure detail; the convergence logic is not. Keeping the consumers
-free of Functions imports is what lets the same code run on a cron box, in a
-GitHub Action, or behind the Flask app in `triggers/generic-webhook/`.
-
-## Guards
-
-Adding devices to groups is safe. Removing them is not, and the two failure
-modes are worth naming:
-
-- **A collapsed parse.** A wrong path, a shallow checkout, a renamed column —
-  the desired set degrades to near-zero, which is a well-formed answer that
-  empties every group on a green build. Caught by `desired_floor`.
-- **A runaway change.** A bulk edit that moves eight hundred machines because
-  somebody sorted a spreadsheet wrong. Caught by `removal_cap`, which skips the
-  suspicious group and carries on with the rest rather than failing everything.
-
-Both read their thresholds from the environment. Set them from *your* baseline
-and record that baseline in a comment. Defaults inherited from someone else's
-estate are decorations, not guards.
+The Munki consumer refuses a projection whose header is not the published
+column order, or with fewer rows than `MUNKI_MIN_ROWS`. Its publish steps
+(push `computers.csv` to the repo host, upload it, purge the CDN path) are left
+as integration points for your own hosting.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MIN_DESIRED_MEMBERSHIPS` | `10` | Floor below which a run is treated as a parse failure |
-| `MAX_REMOVAL_PCT` | `10` | Percentage of a group that one run may remove |
-| `WHATIF` | unset | `true` to log every write instead of making it |
-| `FULL_RUN` | unset | `true` to process every row regardless of the cache |
-| `INTUNE_GROUP_PREFIX` | `Devices` | First component of every group name |
+| `MUNKI_COMPUTERS_CSV_PATH` | `deployment/enroll/computers.csv` | Where the projection is published |
+| `MUNKI_MIN_ROWS` | `1` | Floor below which the projection is refused; set it from your fleet size |
+
+## Triggers
+
+The intune-gitops triggers (an Azure Functions blob trigger and a signed
+generic webhook) reach the built-in `intune` consumer. Register the Munki one
+by name, with the `PYTHONPATH` above:
+
+```
+export ENROLLMENT_CONSUMERS="munki=consumers.munki:converge"
+```
+
+The intune-gitops `consumers` package extends its path, so `consumers.munki`
+resolves from inside a trigger as well as when run directly.
 
 ## Tests
 
+With `PYTHONPATH` set as above:
+
 ```
-python3 tests/test_group_ladder.py
+python3 -m unittest discover -s enrollment/tests -v
 ```
 
-Eleven assertions against an in-memory Graph: the ladder shape, the
-manifest-path round trip, retired devices never being added, a second run
-changing nothing, a collapsed parse removing nothing, a runaway removal being
-capped, and whatIf writing nothing.
+They cover the header check, the row floor, whatIf, and that `munki`
+registers beside the shared `intune` consumer. The group-ladder tests run in
+intune-gitops.
 
-Gate every sync on these. They are the cheapest insurance in the kit.
+The projection test also runs `inventory/projections/project.py` on the sample
+inventory and checks its `munki.csv` header is the one the consumer publishes.

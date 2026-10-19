@@ -1,0 +1,4 @@
+#!/bin/zsh
+# Stop the sync job before an upgrade replaces it.
+launchctl bootout system/com.domain.ApacheTLSSync 2>/dev/null || true
+exit 0
