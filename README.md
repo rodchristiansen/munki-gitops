@@ -37,7 +37,7 @@ Now we have:
 | `githooks/` | Git hooks for an Azure Blob (`azure/`) or S3 (`aws/`) backed repo: pkgsinfo lint, package download on pull, create-only package upload on branch pushes, sync and capped orphan cleanup on main. See its README. |
 | `pipelines/` | Push-to-production pipelines for Azure Pipelines (`azure/`) and GitHub Actions (`github/`), each against Azure Blob + Front Door or S3 + CloudFront. |
 | `preflight/munki/` | A zsh preflight: picks a fresh local mirror or the cloud repo, looks the Mac up in inventory and sets its names and `ClientIdentifier`. |
-| `local-caching/` | Commits listeners for on-prem caching servers: Azure Service Bus or SQS triggers a `git` refresh and a package sync. |
+| `local-caching/` | Commits listeners for on-prem caching servers (Azure Service Bus or SQS triggers a `git` refresh and a package sync), and `apache-tls/`, which serves a mirror over https with a private root and Basic Auth. |
 | `inventory/`, `enrollment/`, `intune/` | Inventory as the source of truth for Entra groups, manifests and Intune assignments (below). |
 | `pkgsinfo/apps/managed/` | Sample Intune VPP app descriptors. |
 

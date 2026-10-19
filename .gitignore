@@ -24,3 +24,9 @@ __pycache__/
 
 # The shared Intune engine, when checked out for a local run or by CI
 /.intune-gitops/
+
+# Terraform working files
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

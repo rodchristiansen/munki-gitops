@@ -10,7 +10,9 @@ Each run it:
 1. **Picks the repository.** The first local mirror whose test catalog answers
    200 *and* was modified in the last 48 hours wins; otherwise the cloud repo.
    A mirror whose sync has died still answers 200 for old files, so
-   reachability alone is not enough.
+   reachability alone is not enough. Each mirror is tried over each scheme in
+   `MIRROR_SCHEMES`, in order, so a Mac that does not trust a mirror's
+   certificate yet can fall back to http on that same mirror.
 2. **Looks the Mac up in inventory.** Downloads `deployment/enroll/computers.csv`
    (published by `enrollment/consumers/munki.py`) from that same repository,
    finds the row for this serial and writes `/Library/Management/Inventory.yaml`.
@@ -31,8 +33,8 @@ and a broken inventory lookup must never stop software from installing.
 
 ## Configure
 
-Edit the block at the top of `payload/preflight`: mirror hosts, the cloud repo
-URL, the provisioning manifests, the retire statuses and the decommission
+Edit the block at the top of `payload/preflight`: mirror hosts and schemes,
+the cloud repo URL, the provisioning manifests, the retire statuses and the decommission
 manifest. Keep the retire statuses in step with `RETIRE_STATUSES` in
 `enrollment/shared/hierarchy.py` in
 [intune-gitops](https://github.com/windowsadmins/intune-gitops).
@@ -46,6 +48,13 @@ names and manifest, is always read over https, from the cloud repo when the
 selected mirror is http. Each inventory value that becomes part of
 `ClientIdentifier` must be a plain path segment (letters, digits, `.`, `_`,
 `-`), so a bad row cannot point the Mac at another tree's manifest.
+
+The preflight also turns on `AdditionalHttpHeadersHttpsOnly`, so Munki itself
+keeps the credential off an http mirror. Upstream Munki does not have that
+preference yet and ignores it; with upstream Munki, leave `http` out of
+`MIRROR_SCHEMES` unless the mirror is on a network where a cleartext
+credential is acceptable. `../../local-caching/apache-tls/` serves a mirror
+over https with a private root, and covers the rollout.
 
 ## Override
 

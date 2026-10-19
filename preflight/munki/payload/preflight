@@ -34,12 +34,18 @@ PS4=''
 # Everything an organisation changes lives here.
 
 # Local caching servers, in order of preference, and the cloud fallback. Each
-# mirror serves the repo at <scheme>://<host>/deployment. Request headers (the
-# repo credential) are only ever sent over https, so a mirror on plain http
-# must serve the repo without authentication.
+# mirror serves the repo at <scheme>://<host>/deployment.
 MIRROR_HOSTS=(mirror1.example.org mirror2.example.org)
-MIRROR_SCHEME="https"
 CLOUD_REPO_URL="https://munki.example.org/deployment"
+
+# Schemes tried on each mirror, in order. A mirror with a certificate from a
+# private root works over https only on Macs that already have the root (from
+# a certificate profile). While that profile is still rolling out, list http
+# after https, so a Mac without the root keeps using the mirror on port 80
+# instead of skipping it; drop http once every Mac has the root. Request
+# headers (the repo credential) are only ever sent over https, so a mirror on
+# plain http must serve the repo without authentication.
+MIRROR_SCHEMES=(https)
 
 # What the freshness probe fetches, and how old it may be.
 MIRROR_TEST_PATH="catalogs/Production.yaml"
@@ -117,7 +123,8 @@ load_request_headers() {
 
 # ── Repository selection ─────────────────────────────────────────────────────
 # mirror_is_fresh <base-url>: the test catalog answers 200 and was modified
-# within MIRROR_MAX_AGE_SECS.
+# within MIRROR_MAX_AGE_SECS. An https probe also fails when this Mac does not
+# trust the mirror's certificate, which is what moves it on to the next scheme.
 mirror_is_fresh() {
   local base="$1" headers http_status lastmod lm_epoch now_epoch
   headers=$(curl -K "$(curl_config_for "$base")" -Is -m 3 "$base/$MIRROR_TEST_PATH" 2>/dev/null) || return 1
@@ -139,14 +146,24 @@ mirror_is_fresh() {
 # to SoftwareRepoURL.
 REPO_URL=""
 configure_repository() {
-  local host base
+  local host scheme base
   log_info "Selecting the Munki repository..."
+
+  # Munki sends AdditionalHttpHeaders with every request, plain http included,
+  # unless this preference is on. Upstream Munki does not have it yet and
+  # ignores it; with upstream Munki, keep http out of MIRROR_SCHEMES, or make
+  # sure an http mirror is never reached with the credential configured.
+  defaults write "$PREFS" AdditionalHttpHeadersHttpsOnly -bool true \
+    || log_warn "Could not set AdditionalHttpHeadersHttpsOnly"
+
   for host in "${MIRROR_HOSTS[@]}"; do
-    base="$MIRROR_SCHEME://$host/deployment"
-    if mirror_is_fresh "$base"; then
-      REPO_URL="$base"
-      break
-    fi
+    for scheme in "${MIRROR_SCHEMES[@]}"; do
+      base="$scheme://$host/deployment"
+      if mirror_is_fresh "$base"; then
+        REPO_URL="$base"
+        break 2
+      fi
+    done
   done
   [[ -n "$REPO_URL" ]] || { REPO_URL="$CLOUD_REPO_URL"; log_detail "No fresh local mirror; using the cloud repo"; }
 

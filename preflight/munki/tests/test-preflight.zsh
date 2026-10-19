@@ -10,7 +10,9 @@ trap 'rm -rf "$FIXTURE"' EXIT
 mkdir -p "$FIXTURE/bin" "$FIXTURE/state"
 export FAKE_STATE="$FIXTURE/state"
 
-# curl: -I requests print $FAKE_STATE/headers-<host>; downloads copy
+# curl: -I requests print $FAKE_STATE/headers-<scheme>-<host> if it exists,
+# else $FAKE_STATE/headers-<host>; a file named fail-<scheme>-<host> makes the
+# probe fail as an untrusted certificate would (exit 60). Downloads copy
 # $FAKE_STATE/csv to the -o target and print the status in $FAKE_STATE/status.
 cat > "$FIXTURE/bin/curl" <<'SH'
 #!/bin/sh
@@ -27,7 +29,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$config" ] && cp "$config" "$FAKE_STATE/last-config"
 host=$(printf '%s' "$url" | sed -E 's#^[a-z]+://([^/]+)/.*#\1#')
+scheme=${url%%://*}
 if $head; then
+  [ -f "$FAKE_STATE/fail-$scheme-$host" ] && exit 60
+  [ -f "$FAKE_STATE/headers-$scheme-$host" ] && { cat "$FAKE_STATE/headers-$scheme-$host"; exit 0; }
   [ -f "$FAKE_STATE/headers-$host" ] || exit 7
   cat "$FAKE_STATE/headers-$host"; exit 0
 fi
@@ -45,7 +50,7 @@ store="$FAKE_STATE/defaults-$domain"
 touch "$store"
 case "$verb" in
   read)  line=$(grep "^$key=" "$store" | tail -1); [ -n "$line" ] || exit 1; printf '%s\n' "${line#*=}" ;;
-  write) [ "$4" = "-string" ] && val="$5" || val="$4"; grep -v "^$key=" "$store" > "$store.tmp" || true; mv "$store.tmp" "$store"; printf '%s=%s\n' "$key" "$val" >> "$store" ;;
+  write) case "$4" in -string|-bool) val="$5" ;; *) val="$4" ;; esac; grep -v "^$key=" "$store" > "$store.tmp" || true; mv "$store.tmp" "$store"; printf '%s=%s\n' "$key" "$val" >> "$store" ;;
 esac
 SH
 
@@ -86,13 +91,25 @@ if [[ "$(uname)" == Darwin ]]; then
   REPO_URL=""; configure_repository 2>/dev/null
   [[ "$REPO_URL" == "https://m2.test/deployment" ]] || fail "expected the fresh mirror, got $REPO_URL"
   grep -q Authorization "$FAKE_STATE/last-config" || fail 'https probe sent no credential'
+  [[ "$(defaults read "$PREFS" AdditionalHttpHeadersHttpsOnly)" == true ]] || fail 'AdditionalHttpHeadersHttpsOnly not set'
 
   # A plain-http mirror is probed without the credential.
-  MIRROR_SCHEME=http
+  MIRROR_SCHEMES=(http)
   REPO_URL=""; configure_repository 2>/dev/null
   [[ "$REPO_URL" == "http://m2.test/deployment" ]] || fail "expected the http mirror, got $REPO_URL"
   if grep -q Authorization "$FAKE_STATE/last-config"; then fail 'credential sent over http'; fi
-  MIRROR_SCHEME=https
+
+  # During a private-root rollout: a Mac that does not trust the mirror's
+  # certificate falls back to http on the same mirror, not to the cloud.
+  MIRROR_SCHEMES=(https http)
+  : > "$FAKE_STATE/fail-https-m2.test"
+  REPO_URL=""; configure_repository 2>/dev/null
+  [[ "$REPO_URL" == "http://m2.test/deployment" ]] || fail "expected http on the untrusted mirror, got $REPO_URL"
+  if grep -q Authorization "$FAKE_STATE/last-config"; then fail 'credential sent over http'; fi
+  rm -f "$FAKE_STATE/fail-https-m2.test"
+  REPO_URL=""; configure_repository 2>/dev/null
+  [[ "$REPO_URL" == "https://m2.test/deployment" ]] || fail "expected https once trusted, got $REPO_URL"
+  MIRROR_SCHEMES=(https)
 
   rm -f "$FAKE_STATE/headers-m2.test"
   REPO_URL=""; configure_repository 2>/dev/null

@@ -1,0 +1,38 @@
+#!/bin/zsh
+# Render the HTTPS vhost for this server and start the daily sync. The vhost is
+# inert until the sync has written a certificate, key and htpasswd.
+
+# The repo checkout the port 80 vhost already serves, and this server's name
+# as clients reach it. Both must match the certificate's DNS names.
+DOC_ROOT="/Users/Shared/munki-repo"
+DOMAIN="example.org"
+
+host=$(scutil --get ComputerName 2>/dev/null || hostname -s)
+FQDN="${host:l}.$DOMAIN"
+
+TLS_CONF_DST="/private/etc/apache2/other/repo-tls.conf"
+sed -e "s|__FQDN__|$FQDN|g" -e "s|__DOCROOT__|$DOC_ROOT|g" \
+  /Library/Management/ApacheConfig/repo-tls.conf > "$TLS_CONF_DST"
+chown root:wheel "$TLS_CONF_DST"
+chmod 644 "$TLS_CONF_DST"
+
+if ! /usr/sbin/httpd -t 2>/dev/null; then
+  echo "ERROR: Apache configuration check failed; removing $TLS_CONF_DST"
+  /usr/sbin/httpd -t
+  rm -f "$TLS_CONF_DST"
+  exit 1
+fi
+
+chown -R root:wheel /Library/Management/ApacheTLS
+chmod 700 /Library/Management/ApacheTLS
+chmod 700 /Library/Management/ApacheTLS/apache-tls-sync.sh
+mkdir -p /Library/Management/Logs
+
+PLIST=/Library/LaunchDaemons/com.domain.ApacheTLSSync.plist
+chown root:wheel "$PLIST"
+chmod 644 "$PLIST"
+launchctl bootstrap system "$PLIST"
+launchctl enable system/com.domain.ApacheTLSSync
+
+echo "ApacheTLS: vhost rendered for $FQDN; sync job loaded"
+exit 0
