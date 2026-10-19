@@ -54,7 +54,7 @@ keeps the credential off an http mirror. Upstream Munki does not have that
 preference yet and ignores it; with upstream Munki, leave `http` out of
 `MIRROR_SCHEMES` unless the mirror is on a network where a cleartext
 credential is acceptable. `../../local-caching/apache-tls/` serves a mirror
-over https with a private root, and covers the rollout.
+over https with its own self-signed certificate, and covers the rollout.
 
 ## Override
 

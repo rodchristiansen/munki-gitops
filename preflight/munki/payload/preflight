@@ -38,11 +38,11 @@ PS4=''
 MIRROR_HOSTS=(mirror1.example.org mirror2.example.org)
 CLOUD_REPO_URL="https://munki.example.org/deployment"
 
-# Schemes tried on each mirror, in order. A mirror with a certificate from a
-# private root works over https only on Macs that already have the root (from
-# a certificate profile). While that profile is still rolling out, list http
-# after https, so a Mac without the root keeps using the mirror on port 80
-# instead of skipping it; drop http once every Mac has the root. Request
+# Schemes tried on each mirror, in order. A mirror with a self-signed
+# certificate works over https only on Macs that already trust it (from a
+# certificate profile). While that profile is still rolling out, list http
+# after https, so a Mac without it keeps using the mirror on port 80 instead
+# of skipping it; drop http once every Mac has it. Request
 # headers (the repo credential) are only ever sent over https, so a mirror on
 # plain http must serve the repo without authentication.
 MIRROR_SCHEMES=(https)

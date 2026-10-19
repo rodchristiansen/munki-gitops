@@ -99,7 +99,7 @@ if [[ "$(uname)" == Darwin ]]; then
   [[ "$REPO_URL" == "http://m2.test/deployment" ]] || fail "expected the http mirror, got $REPO_URL"
   if grep -q Authorization "$FAKE_STATE/last-config"; then fail 'credential sent over http'; fi
 
-  # During a private-root rollout: a Mac that does not trust the mirror's
+  # During a certificate rollout: a Mac that does not trust the mirror's
   # certificate falls back to http on the same mirror, not to the cloud.
   MIRROR_SCHEMES=(https http)
   : > "$FAKE_STATE/fail-https-m2.test"

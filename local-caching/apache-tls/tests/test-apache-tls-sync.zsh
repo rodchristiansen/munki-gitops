@@ -37,14 +37,14 @@ SH
 chmod +x "$FIXTURE/bin/"*
 : > "$FIXTURE/sp.pem"
 
-printf -- '-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n' > "$FIXTURE/secrets/CachingServerCertificate"
-printf -- '-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n' > "$FIXTURE/secrets/CachingServerKey"
+printf -- '-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n' > "$FIXTURE/secrets/CachingServerCertificate-mirror1-example-org"
+printf -- '-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----\n' > "$FIXTURE/secrets/CachingServerKey-mirror1-example-org"
 print repo > "$FIXTURE/secrets/MunkiUsername"
 print s3cret > "$FIXTURE/secrets/MunkiPassword"
 
 run() {
   AZ="$FIXTURE/bin/az" SP_PEM="$FIXTURE/sp.pem" TLS_DIR="$FIXTURE/tls" STATE_DIR="$FIXTURE/state" \
-    HTTPD="$FIXTURE/bin/httpd" HTPASSWD="$FIXTURE/bin/htpasswd" HTTPD_CONF="$FIXTURE/none" \
+    HTTPD="$FIXTURE/bin/httpd" HTPASSWD="$FIXTURE/bin/htpasswd" HTTPD_CONF="$FIXTURE/none" SERVER_FQDN=mirror1.example.org \
     zsh "$SYNC" >/dev/null
 }
 fail() { print -u2 "FAIL: $1"; exit 1; }
@@ -64,7 +64,7 @@ run
 grep -qx 'repo:rotated' "$FIXTURE/tls/htpasswd" || fail 'rotated password not picked up'
 [[ "$(reloads)" == 2 ]] || fail 'rotation did not reload'
 
-rm "$FIXTURE/secrets/CachingServerCertificate"
+rm "$FIXTURE/secrets/CachingServerCertificate-mirror1-example-org"
 run
 grep -q leaf "$FIXTURE/tls/server.crt" || fail 'lost the certificate when Key Vault was unreadable'
 [[ "$(reloads)" == 2 ]] || fail 'reloaded with nothing changed'

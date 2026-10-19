@@ -2,8 +2,9 @@
 # Pull this caching server's TLS certificate, key and the repo's Basic Auth
 # credential from Key Vault, and reload Apache if any of them changed.
 #
-# The certificate comes from a private root (terraform/caching-tls.tf); managed
-# Macs trust that root through a certificate profile. az signs in as a service
+# The certificate is this server's own self-signed one (terraform/caching-tls.tf),
+# and Macs trust that certificate alone through a certificate profile, so the
+# key read here can impersonate this server and nothing else. az signs in as a service
 # principal with a certificate kept on the server, in its own az profile so it
 # never touches another user's session. Runs daily from
 # com.domain.ApacheTLSSync, and at load.
@@ -19,8 +20,7 @@ SP_PEM=${SP_PEM:-/Library/Management/ApacheTLS/sp.pem}
 SP_CLIENT_ID=${SP_CLIENT_ID:-00000000-0000-0000-0000-000000000000}
 TENANT_ID=${TENANT_ID:-00000000-0000-0000-0000-000000000000}
 VAULT=${VAULT:-example-repo-secrets}
-CERT_SECRET=CachingServerCertificate
-KEY_SECRET=CachingServerKey
+DOMAIN=${DOMAIN:-example.org}
 USER_SECRET=MunkiUsername
 PASS_SECRET=MunkiPassword
 
@@ -35,6 +35,15 @@ set +x
 setopt NO_XTRACE
 
 log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+# This server's name as clients reach it, which names its secrets: dots become
+# dashes, because Key Vault secret names allow letters, digits and dashes only.
+if [[ -z ${SERVER_FQDN:-} ]]; then
+  SERVER_FQDN=$(scutil --get ComputerName 2>/dev/null || hostname -s)
+  SERVER_FQDN="${SERVER_FQDN:l}.$DOMAIN"
+fi
+CERT_SECRET="CachingServerCertificate-${SERVER_FQDN//./-}"
+KEY_SECRET="CachingServerKey-${SERVER_FQDN//./-}"
 
 # Apache's workers run as this user and read the htpasswd on every request.
 APACHE_USER=$(awk '$1 == "User" {print $2; exit}' "$HTTPD_CONF" 2>/dev/null)

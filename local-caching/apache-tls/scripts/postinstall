@@ -2,8 +2,9 @@
 # Render the HTTPS vhost for this server and start the daily sync. The vhost is
 # inert until the sync has written a certificate, key and htpasswd.
 
-# The repo checkout the port 80 vhost already serves, and this server's name
-# as clients reach it. Both must match the certificate's DNS names.
+# The repo checkout the port 80 vhost already serves, and the domain that
+# makes this server's name as clients reach it. That name must match the
+# certificate's, and DOMAIN must match the one in apache-tls-sync.sh.
 DOC_ROOT="/Users/Shared/munki-repo"
 DOMAIN="example.org"
 
