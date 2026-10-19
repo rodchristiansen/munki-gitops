@@ -27,7 +27,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: windowsadmins/intune-gitops
-          ref: 36359ce4594e1012542592a940b346ed20ed09db # v0.1.2
+          ref: f5c18eaaa5f7b1d6e5bccea5087c4f0fd80972f3 # v0.1.4
           path: .intune-gitops
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

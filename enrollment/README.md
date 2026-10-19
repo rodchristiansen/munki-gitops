@@ -15,7 +15,7 @@ inventory.csv
 
 The shared parts (the naming convention, the Graph client, the guards, the
 Intune group-ladder consumer and the triggers) live in
-[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops/tree/v0.1.2/enrollment),
+[windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops/tree/v0.1.4/enrollment),
 together with their tests and the reasoning behind the guards. This directory
 keeps only the Munki consumer, which imports `shared/` from there.
 
@@ -41,7 +41,7 @@ consumer that applies deltas will happily apply the same delta twice.
 Check intune-gitops out beside this repo at the tag the pipelines pin:
 
 ```
-git clone --branch v0.1.2 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+git clone --branch v0.1.4 https://github.com/windowsadmins/intune-gitops ../intune-gitops
 ```
 
 Then put both enrollment directories on `PYTHONPATH`, **this repo's first**.

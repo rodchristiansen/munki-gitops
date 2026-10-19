@@ -9,7 +9,7 @@ The engine that does this is shared with the Windows sibling and lives in
 [windowsadmins/intune-gitops](https://github.com/windowsadmins/intune-gitops).
 This directory keeps only what is Munki's: the manifests, the profiles, the
 catalog and PayloadVersion check and the pipelines that call the engine at a
-pinned tag (currently `v0.1.2`). Stages, guards, the condition translator and
+pinned tag (currently `v0.1.4`). Stages, guards, the condition translator and
 their tests are documented and tested there.
 
 The Windows half of the same pattern lives in
@@ -53,7 +53,7 @@ shared address space is.
 Check the engine out beside this repo at the pinned tag, and install PyYAML:
 
 ```
-git clone --branch v0.1.2 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+git clone --branch v0.1.4 https://github.com/windowsadmins/intune-gitops ../intune-gitops
 ```
 
 ```
@@ -106,7 +106,7 @@ The full table, and the rules Intune enforces on `NOT`, are in the
 
 ## Pipelines
 
-Both callers pin intune-gitops: the Azure one by `ref: refs/tags/v0.1.2` on its
+Both callers pin intune-gitops: the Azure one by `ref: refs/tags/v0.1.4` on its
 repository resource, the GitHub one by the tag's commit SHA. An engine change
 reaches this repo only when the pin moves. Both pass the Munki check into the
 engine's test stage.
@@ -116,7 +116,7 @@ write identity. The YAML conditions are a convenience; the boundary is the
 approvals, branch control and required-template checks on the write service
 connection and environment (Azure), or the environment protection rules and
 federated credential (GitHub). Set those up from
-[pipelines/README.md](https://github.com/windowsadmins/intune-gitops/blob/v0.1.2/pipelines/README.md)
+[pipelines/README.md](https://github.com/windowsadmins/intune-gitops/blob/v0.1.4/pipelines/README.md)
 in intune-gitops before the first real run.
 
 `pipelines/reference/` is the production pipeline, lifted nearly as-is and

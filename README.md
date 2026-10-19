@@ -149,7 +149,7 @@ The Intune engine and the shared enrollment code live in
 beside this repo at the tag the pipelines pin:
 
 ```
-git clone --branch v0.1.2 https://github.com/windowsadmins/intune-gitops ../intune-gitops
+git clone --branch v0.1.4 https://github.com/windowsadmins/intune-gitops ../intune-gitops
 ```
 
 Project the inventory:
