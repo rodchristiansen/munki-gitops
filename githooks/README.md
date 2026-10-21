@@ -65,6 +65,8 @@ The hooks read environment variables for everything that might differ between or
 | `MUNKI_S3_BUCKET`                  | `your-munki-bucket`     | S3 bucket name.                                 |
 | `MUNKI_S3_PREFIX`                  | *(empty)*               | Optional key prefix inside the bucket.          |
 | `MUNKI_AWS_REGION`                 | `us-east-1`             | Region for SigV4 signing / endpoint.            |
+| `MUNKI_S3_MULTIPART_THRESHOLD`     | `1073741824` (1 GiB)    | Branch uploads above this many bytes go up as a multipart upload. |
+| `MUNKI_S3_PART_SIZE`               | `67108864` (64 MiB)     | Multipart part size in bytes, at least 5 MiB. It grows on its own to stay within 10,000 parts. |
 | `MUNKI_CACHING_SERVERS`            | *(empty)*               | Same as Azure — HTTP caching fast-path.         |
 
 ### Cross-cutting
@@ -117,6 +119,7 @@ What a push does depends on the branch.
 2. Refuses an `installer_item_location` that is absolute or contains an empty or `..` segment. A location becomes a local path and a storage key, so it must stay under `deployment/pkgs/`.
 3. Accepts a package already in storage only when its `sha256` metadata matches the pkgsinfo's `installer_item_hash`.
 4. Uploads a missing package create-only (`azcopy --overwrite=false`, S3 `--if-none-match '*'`) after checking the local file's SHA-256, and records that hash in the object's metadata. Losing a create race to the same bytes is fine; to different bytes it blocks.
+   On S3, a package above `MUNKI_S3_MULTIPART_THRESHOLD` goes up as a multipart upload, because a single PUT stops at 5 GB. It sets `sha256` metadata when the upload is created, and sends a SHA-256 checksum with every part, which S3 verifies. The completing call uses `--if-none-match '*'`. Afterwards it checks the object's size and metadata. On any failure, or if the push is interrupted, it aborts the upload so no parts are left behind. The bucket should still have a lifecycle rule that aborts incomplete multipart uploads after a day, to catch a killed process.
 5. Refuses to replace a package path that holds different bytes. Package paths are immutable: clients and the CDN cache them for a year.
 6. Records SHA-256 metadata on a legacy object only with proof: its MD5 (Azure) or single-part ETag (S3) matches the local file, or `origin/main` already assigns that hash to that path.
 
