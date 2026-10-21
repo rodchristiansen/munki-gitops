@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# HOOK_VERSION=2026.10.07
+# HOOK_VERSION=2026.10.20
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-push-pr-packages  –  branch pushes: make every package a pushed pkgsinfo

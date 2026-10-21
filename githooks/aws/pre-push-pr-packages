@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# HOOK_VERSION=2026.10.07
+# HOOK_VERSION=2026.10.20
 #
 # ──────────────────────────────────────────────────────────────────────────────
 #  pre-push-pr-packages  –  branch pushes: make every package a pushed pkgsinfo
@@ -19,10 +19,19 @@
 #    • skips nopkg, profile and apple_update_metadata items and Intune
 #      descriptors under apps/managed.
 #
-#  It never deletes anything. Single PUTs are limited to 5 GB; upload a larger
-#  package from main with `git push -- --path <file>`.
+#  Packages above MUNKI_S3_MULTIPART_THRESHOLD (default 1 GiB) go up as a
+#  multipart upload instead of a single PUT, which S3 caps at 5 GB. The
+#  multipart path keeps the same guarantees: sha256 metadata set when the
+#  upload is created, a SHA-256 checksum on every part that S3 verifies,
+#  --if-none-match '*' on the completing call, a size and metadata check
+#  afterwards, and an abort on any failure or interruption so no parts are
+#  left behind.
 #
-#  Config: MUNKI_S3_BUCKET, MUNKI_S3_PREFIX, MUNKI_AWS_REGION.
+#  It never deletes anything.
+#
+#  Config: MUNKI_S3_BUCKET, MUNKI_S3_PREFIX, MUNKI_AWS_REGION,
+#  MUNKI_S3_MULTIPART_THRESHOLD (bytes), MUNKI_S3_PART_SIZE (bytes, default
+#  64 MiB; S3 needs at least 5 MiB for every part but the last).
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 set -f
@@ -33,9 +42,27 @@ S3_PREFIX="${MUNKI_S3_PREFIX:-}"
 AWS_REGION="${MUNKI_AWS_REGION:-${AWS_REGION:-us-east-1}}"
 KEY_ROOT="${S3_PREFIX:+$S3_PREFIX/}deployment/pkgs"
 ZERO_SHA="0000000000000000000000000000000000000000"
+MULTIPART_THRESHOLD="${MUNKI_S3_MULTIPART_THRESHOLD:-1073741824}"
+PART_SIZE="${MUNKI_S3_PART_SIZE:-67108864}"
+MAX_PARTS=10000
+[[ "$MULTIPART_THRESHOLD" == <-> && "$PART_SIZE" == <1-> ]] || {
+  print -u2 "ERROR: MUNKI_S3_MULTIPART_THRESHOLD and MUNKI_S3_PART_SIZE must be whole byte counts."
+  exit 1
+}
 
 changed_file_list=$(mktemp)
-trap 'rm -f "$changed_file_list"' EXIT
+MPU_KEY="" MPU_ID="" MPU_DIR=""
+abort_multipart() {
+  if [[ -n "$MPU_ID" ]]; then
+    aws s3api abort-multipart-upload --bucket "$S3_BUCKET" --key "$MPU_KEY" \
+      --upload-id "$MPU_ID" --region "$AWS_REGION" >/dev/null 2>&1 \
+      || print -u2 "WARNING: could not abort multipart upload $MPU_ID for $MPU_KEY; abort it by hand."
+  fi
+  [[ -n "$MPU_DIR" ]] && rm -rf "$MPU_DIR"
+  MPU_KEY="" MPU_ID="" MPU_DIR=""
+}
+trap 'abort_multipart; rm -f "$changed_file_list"' EXIT
+trap 'exit 130' INT TERM HUP
 
 collect_changed_pkgsinfo() {
   local saw_ref=false line local_ref local_sha remote_ref remote_sha base range
@@ -92,6 +119,70 @@ sha256_of() {
 }
 
 md5_hex() { openssl dgst -md5 "$1" | awk '{print $NF}'; }
+
+file_size() { wc -c < "$1" | tr -d ' '; }
+
+# Uploads one object create-only. Small files take a single PUT; large ones a
+# multipart upload with a verified SHA-256 checksum per part. Returns 1 when
+# the upload did not land (a concurrent create may have won) and 2 when it
+# landed but does not match afterwards.
+upload_object() {
+  local key="$1" src="$2" hash="$3" size
+  size=$(file_size "$src")
+  if (( size <= MULTIPART_THRESHOLD )); then
+    aws s3api put-object --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" \
+      --body "$src" --if-none-match '*' --metadata "sha256=$hash" \
+      --cache-control "public, max-age=31536000, immutable" >/dev/null || return 1
+    return 0
+  fi
+  local rc=0
+  upload_multipart "$key" "$src" "$hash" "$size" || rc=$?
+  abort_multipart
+  return $rc
+}
+
+upload_multipart() {
+  local key="$1" src="$2" hash="$3" size="$4" part_size="$PART_SIZE" parts n etag sum sep=""
+  (( (size + part_size - 1) / part_size > MAX_PARTS )) && part_size=$(( (size + MAX_PARTS - 1) / MAX_PARTS ))
+  parts=$(( (size + part_size - 1) / part_size ))
+  print "[pre-push] Multipart upload of $(( size / 1048576 )) MiB in $parts part(s): ${key##*/}"
+
+  MPU_DIR=$(mktemp -d)
+  MPU_KEY="$key"
+  MPU_ID=$(aws s3api create-multipart-upload --bucket "$S3_BUCKET" --key "$key" \
+    --region "$AWS_REGION" --metadata "sha256=$hash" --checksum-algorithm SHA256 \
+    --cache-control "public, max-age=31536000, immutable" \
+    --query UploadId --output text) || { MPU_ID=""; return 1; }
+  [[ -n "$MPU_ID" && "$MPU_ID" != None ]] || { MPU_ID=""; return 1; }
+
+  print -n '{"Parts":[' > "$MPU_DIR/parts.json"
+  for (( n = 1; n <= parts; n++ )); do
+    dd if="$src" of="$MPU_DIR/part" bs="$part_size" skip=$(( n - 1 )) count=1 2>/dev/null || return 1
+    sum=$(openssl dgst -sha256 -binary "$MPU_DIR/part" | openssl base64 -A) || return 1
+    etag=$(aws s3api upload-part --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" \
+      --upload-id "$MPU_ID" --part-number "$n" --body "$MPU_DIR/part" \
+      --checksum-sha256 "$sum" --query ETag --output text) || return 1
+    etag="${etag//\"/}"
+    [[ "$etag" =~ ^[0-9A-Za-z-]+$ ]] || return 1
+    print -rn -- "$sep{\"PartNumber\":$n,\"ETag\":\"\\\"$etag\\\"\",\"ChecksumSHA256\":\"$sum\"}" >> "$MPU_DIR/parts.json"
+    sep=","
+  done
+  print -n ']}' >> "$MPU_DIR/parts.json"
+
+  aws s3api complete-multipart-upload --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" \
+    --upload-id "$MPU_ID" --multipart-upload "file://$MPU_DIR/parts.json" \
+    --if-none-match '*' >/dev/null || return 1
+  MPU_ID=""
+  rm -rf "$MPU_DIR"; MPU_DIR=""
+
+  local remote_size
+  remote_size=$(aws s3api head-object --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" \
+    --query '[ContentLength, Metadata.sha256]' --output text) || return 2
+  [[ "$remote_size" == "$size"$'\t'"$hash" ]] || {
+    print -u2 "ERROR: $key does not match after upload (got: $remote_size). Check and remove it by hand."
+    return 2
+  }
+}
 
 # Prints "<etag>\t<sha256-metadata>" for an object. 0 exists, 1 absent,
 # 2 could not tell.
@@ -226,11 +317,11 @@ while IFS= read -r pkgsinfo; do
   fi
 
   print "[pre-push] Uploading package for $pkgsinfo: $location"
-  if aws s3api put-object --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" \
-      --body "$local_path" --if-none-match '*' --metadata "sha256=$expected_hash" \
-      --cache-control "public, max-age=31536000, immutable" >/dev/null; then
+  upload_status=0
+  upload_object "$key" "$local_path" "$expected_hash" || upload_status=$?
+  if (( upload_status == 0 )); then
     :
-  elif head_object "$key" && [[ "$(head_sha256)" == "$expected_hash" ]]; then
+  elif (( upload_status == 1 )) && head_object "$key" && [[ "$(head_sha256)" == "$expected_hash" ]]; then
     print "[pre-push] Another checkout uploaded the same package: $location"
   else
     fail "Upload of $location failed or collided with different bytes."
